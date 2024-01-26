@@ -15,7 +15,8 @@ Lexing: Pretty Basic, nothing to write home about. (lexer.h: TokenType, Token, L
 Parsing: Simple Pratt Parsing, Jai/Odin/Pascal like syntax. (parser.h: NodeType, ASTNode, ConstantValue, Parser)\
 \
 Checking: Due to wanting to support out-of-order declarations the Checking is split into 2 Phases: Outer and Inner\
-The Outer Check does not check statements within statements/expressions (So sub-statements in a {} scope are not checked here). But it does figure out the expression type of all expressions.\
+The Outer Check does not check statements within statements/expressions (So sub-statements in a {} scope are not checked here).\
+But it does figure out the expression type of all expressions.\
 The Inner Check does the recursive check into sub-statements within statements/expressions.\
 (checker.h: TypeKind, ValueType, Symbol, Checker)\
 

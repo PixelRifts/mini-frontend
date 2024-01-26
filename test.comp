@@ -1,0 +1,21 @@
+vec2 :: struct {
+	x: f32;
+	y: f32;
+};
+
+complex :: struct {
+	real: f32;
+	imaginary: f32;
+};
+
+not_the_same :: struct {
+	real: i32;
+	imaginary: i32;
+};
+
+foo :: func() {
+	v: vec2;
+	c: complex;
+	c = cast(complex) v;
+	t := cast(vec2) c;
+};

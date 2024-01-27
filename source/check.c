@@ -1114,6 +1114,17 @@ static void Checker_CheckOuter(Checker* checker, ASTNode* node) {
       if (node->decl.val && k.is_constant)
         k.constant_val = node->decl.val->constant_val;
       
+      i32 idx = -1;
+      for (i32 i = checker->symbols.len-1; i >= 0; i--) {
+        if (checker->symbols.elems[i].scope != checker->scope) break;
+        if (str_eq(checker->symbols.elems[i].ident.lexeme, k.ident.lexeme)) {
+          idx = i;
+        }
+      }
+      if (idx != -1) {
+        CheckerError(checker, node->marker, "Redeclaration of symbol '%.*s'\n", str_expand(k.ident.lexeme));
+      }
+      
 #if defined(PRINT_ON_SYMBOL_REGISTER)
       string tn = Debug_GetTypeString(&checker->arena, k.type);
       printf("Registered Symbol %.*s: %.*s\n", str_expand(k.ident.lexeme),

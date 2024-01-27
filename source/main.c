@@ -44,6 +44,13 @@ int main(int arc, char** argv) {
   parser.filename = fp;
   ASTNode* tree = Parser_Parse(&parser, tokens);
   
+  if (parser.errored) {
+    Parser_Free(&parser);
+    arena_free(&arena);
+    tctx_free(&tctx);
+    return 1;
+  }
+  
   ASTNode* curr_node = tree;
   while (curr_node) {
     Debug_Dump_ASTree(curr_node);
@@ -55,9 +62,19 @@ int main(int arc, char** argv) {
   checker.filename = fp;
   Checker_Init(&checker);
   Checker_Check(&checker, tree);
+  
+  if (checker.errored) {
+    Checker_Free(&checker);
+    Parser_Free(&parser);
+    arena_free(&arena);
+    tctx_free(&tctx);
+    return 1;
+  }
+  
   Checker_Free(&checker);
   Parser_Free(&parser);
   
   arena_free(&arena);
   tctx_free(&tctx);
+  return 0;
 }

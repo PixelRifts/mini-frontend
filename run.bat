@@ -1,2 +1,2 @@
 @ECHO off
-CALL bin\compile2.exe test.comp
+CALL bin\compile3.exe "examples\simple_stuff.comp"

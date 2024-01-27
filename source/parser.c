@@ -2,9 +2,12 @@
 #include "parser.h"
 #include "base/log.h"
 
-#define ParserError(p, t, f, ...) printf("%.*s:%d:%d - Parse Error - " f,\
+#define ParserError(p, t, f, ...) Statement(\
+printf("%.*s:%d:%d - Parse Error - " f,\
 str_expand(p->filename), t.line, t.col,\
-##__VA_ARGS__ )
+##__VA_ARGS__);\
+p->errored = true;\
+)
 
 DArray_Impl(ASTNodeRef);
 

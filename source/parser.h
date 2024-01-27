@@ -205,6 +205,7 @@ typedef struct Parser {
   u64 curr, next;
   Token_array tokens;
   string filename;
+  b8 errored;
 } Parser;
 
 void     Parser_Init(Parser* parser);

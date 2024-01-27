@@ -159,7 +159,6 @@ Token_array Lexer_Lex(Lexer* lexer, string source) {
       
       case '+': darray_add(Token, &tokens, make_token(lexer, TT_Plus)); break;
       case '*': darray_add(Token, &tokens, make_token(lexer, TT_Star)); break;
-      case '/': darray_add(Token, &tokens, make_token(lexer, TT_Slash)); break;
       case '%': darray_add(Token, &tokens, make_token(lexer, TT_Percent)); break;
       case '^': darray_add(Token, &tokens, make_token(lexer, TT_Caret)); break;
       case '{': darray_add(Token, &tokens, make_token(lexer, TT_OpenBrace)); break;
@@ -172,6 +171,20 @@ Token_array Lexer_Lex(Lexer* lexer, string source) {
       case ';': darray_add(Token, &tokens, make_token(lexer, TT_Semicolon)); break;
       case ',': darray_add(Token, &tokens, make_token(lexer, TT_Comma)); break;
       case '.': darray_add(Token, &tokens, make_token(lexer, TT_Dot)); break;
+      
+      case '/': {
+        if (*lexer->curr == '/') {
+          while (*lexer->curr != '\n' && *lexer->curr != '\0') {
+            lexer->curr++;
+            lexer->col++;
+          }
+          if (*lexer->curr != '\0') lexer->curr++;
+          lexer->col = 0;
+          lexer->line++;
+          continue;
+        } else
+          darray_add(Token, &tokens, make_token(lexer, TT_Slash)); break;
+      } break;
       
       case '-': {
         if (*lexer->curr == '>') {

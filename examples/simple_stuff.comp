@@ -1,0 +1,59 @@
+
+// Types:
+//
+// Signed Integers:   i32, i64
+// Unsigned Integers: u32, u64
+// Floats:            f32, f64
+// Structs:           struct { mem1: type1; mem2: type2; }
+// Unions:            union { mem1: type1; mem2: type2; }
+// Functions:         func (arg1: type1, arg2: type2) -> ret  
+// Note: Arg names are optional
+//
+// Type Modifiers:
+// Pointer To:   ^type
+// Array Of:     [N]type   (N should be a constant integer)
+
+
+// Declarations are Odin/Jai style.
+//
+// Constant Declarations are
+//   name: type : value;
+// Non-Constant Declarations are
+//   name: type = value;
+//
+// You can omit the value to declare a variable that isn't initialized.
+// These are always non-constant
+//   name: type;
+//
+// You can omit the type for it to be inferred.
+//   name: : value;
+//   name: = value;
+//
+// And then you can rearrange the characters.
+//   name :: value;      Constant Declaration
+//   name := value;      Non-Constant Declaration
+//
+
+t_1 :: 20;
+t_2 := 20;
+
+// Function Declarations are just simple declarations but
+//  you use a function expression as the value
+//
+// A function expression is simply:
+//   func (arg1: type1, arg2: type2) -> return_type {
+//   }
+//
+// Note the {} at the end, which is what puts it apart from a function type.
+// The return type can be omitted to automatically default to void
+
+main :: func () {
+	// Some expression differences with C:
+	
+	a: i32 = -10;
+	ap: ^i32 = &a;
+
+	
+	b := ap^;           // Dereference Operator is postfix ^
+	c := cast(f32) a;   // Cast operator requires the cast keyword
+};

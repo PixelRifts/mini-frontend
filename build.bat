@@ -3,7 +3,7 @@ SetLocal EnableDelayedExpansion
 IF NOT EXIST bin mkdir bin
 IF NOT EXIST bin\int mkdir bin\int
 
-SET name=compile2
+SET name=compile3
 
 REM call vcvarsall.bat x64
 SET cc=clang

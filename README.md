@@ -10,15 +10,17 @@ A highly minimal compiler frontend, useful for experimentation
 ## Structure
 Note: Important Declarations in Parens.\
 \
-Lexing: Pretty Basic, nothing to write home about. (lexer.h: TokenType, Token, Lexer)\
+Lexing: (lexer.h: TokenType, Token, Lexer)\
+Pretty Basic, nothing to write home about.\
 \
-Parsing: Simple Pratt Parsing, Jai/Odin/Pascal like syntax. (parser.h: NodeType, ASTNode, ConstantValue, Parser)\
+Parsing: (parser.h: NodeType, ASTNode, ConstantValue, Parser)\
+Simple Pratt Parsing, Jai/Odin/Pascal like syntax.\
 \
-Checking: Due to wanting to support out-of-order declarations the Checking is split into 2 Phases: Outer and Inner\
-The Outer Check does not check statements within statements/expressions (So sub-statements in a {} scope are not checked here).\
-But it does figure out the expression type of all expressions.\
-The Inner Check does the recursive check into sub-statements within statements/expressions.\
-(checker.h: TypeKind, ValueType, Symbol, Checker)\
+Checking: (check.h: ValueTypeKind, ValueType, Symbol, CheckingWork, Checker)\
+Checking is done via a simple worklist algorithm.\
+Two major functions are implemented: IsReady(Node) and Transfer(Node).\
+IsReady: Thinking of an ASTNode as a node in a directed dependency graph instead of an AST, the IsReady function returns true if all the incoming dependency edges are resolved or ready to be resolved. Along with that, the node's status is also set appropriately.\
+Transfer: Given that the node is ready to be resolved, the Transfer function does the actual resolving.
 
 ## TODOs
 - Some code samples.

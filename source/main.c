@@ -51,12 +51,11 @@ int main(int arc, char** argv) {
     return 1;
   }
   
-  ASTNode* curr_node = tree;
-  while (curr_node) {
-    Debug_Dump_ASTree(curr_node);
-    curr_node = curr_node->next;
+  ASTNode* curr = tree;
+  while (curr) {
+    Debug_Dump_ASTree(curr);
+    curr = curr->next;
   }
-  flush;
   
   Checker checker = {0};
   checker.filename = fp;

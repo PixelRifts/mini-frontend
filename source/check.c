@@ -1,15 +1,26 @@
 #include "check.h"
 #include "base/log.h"
+#include <assert.h>
 
 //~ Preproc Params
 
-// #define PRINT_ON_SYMBOL_REGISTER
+#define PRINT_DEPENDENCIES 1
+#define POINTER_SIZE 8
 
-//~
+//~ Uber-Helpers
 
 #define CheckerError(c, t, f, ...)\
 Statement(\
 if (!c->errored) printf("%.*s:%d:%d - Check Error - " f,\
+str_expand(c->filename), t.line, t.col,\
+##__VA_ARGS__);\
+c->errored = true;\
+return; /* Maybe this should go */\
+)
+
+#define CheckerErrorNoRet(c, t, f, ...)\
+Statement(\
+printf("%.*s:%d:%d - Check Error - " f,\
 str_expand(c->filename), t.line, t.col,\
 ##__VA_ARGS__);\
 c->errored = true;\
@@ -30,248 +41,136 @@ enum {
   
   Type_Index_Count,
 };
-static ValueType* type_refs[Type_Index_Count] = {0};
+DArray_Impl(ValueTypeRef);
+Queue_Impl(CheckingWork);
 
-//~
+b8 is_power_of_two(uintptr_t x) {
+  return (x & (x-1)) == 0;
+}
+
+u64 align_forward_u64(u64 ptr, u64 align) {
+  u64 p, a, modulo;
+  
+  assert(is_power_of_two(align));
+  
+  p = ptr;
+  a = (size_t)align;
+  // Same as (p % a) but faster as 'a' is a power of two
+  modulo = p & (a-1);
+  
+  if (modulo != 0) {
+    // If 'p' address is not aligned, push the address to the
+    // next value which is aligned
+    p += a - modulo;
+  }
+  return p;
+}
+
+//~ Type Helpers
 
 #define FNV_OFFSET_BASIS 14695981039346656037ull
 #define FNV_PRIME 1099511628211llu
 M_Arena* global_arena_t;
 
-#define printtype(t) Statement(\
-string v = Debug_GetTypeString(global_arena_t, t);\
-printf("%.*s\n", str_expand(v));\
-)
+#define TypeGet(c, idx) (c->type_cache.elems[idx])
 
-static b8 func_node_is_null(ASTNode* node) { return node == nullptr; }
-static b8 func_nodes_eq(ASTNode* a, ASTNode* b) {
-  ASTNode* a_return_type = a->type == NT_Expr_Func
-    ? a->func.return_type : a->func_type.return_type;
-  ASTNode* a_curr = a->type == NT_Expr_Func
-    ? a->func.arg_types : a->func_type.arg_types;
-  u32 a_arity = a->type == NT_Expr_Func
-    ? a->func.arity : a->func_type.arity;
-  ASTNode* b_return_type = b->type == NT_Expr_Func
-    ? b->func.return_type : b->func_type.return_type;
-  ASTNode* b_curr = b->type == NT_Expr_Func
-    ? b->func.arg_types : b->func_type.arg_types;
-  u32 b_arity = b->type == NT_Expr_Func
-    ? b->func.arity : b->func_type.arity;
+b8 CheckAbsolute(Checker* c, TypeIndex a, TypeIndex b) {
+  if (a == b) return true;
+  ValueType* at = TypeGet(c, a);
+  ValueType* bt = TypeGet(c, b);
+  if (at->type != bt->type) return false;
   
-  if (a_arity != b_arity) return false;
-  if (a_return_type->constant_val.type_lit != b_return_type->constant_val.type_lit)
-    return false;
-  while (a_arity--) {
-    if (a_curr->constant_val.type_lit != b_curr->constant_val.type_lit) return false;
-    a_curr = a_curr->next;
-    b_curr = b_curr->next;
-  }
-  return true;
-}
-static u64 hash_func(ASTNode* node) {
-  u64 hash = FNV_OFFSET_BASIS;
-  if (node->type == NT_Expr_Func) {
-    if (node->func.return_type) {
-      hash ^= (u64) node->func.return_type->constant_val.type_lit;
-      hash *= FNV_PRIME;
-    } else {
-      hash ^= (u64) type_refs[Type_Index_Void];
-      hash *= FNV_PRIME;
+  switch (at->type) {
+    case TK_MAX:
+    case TK_None:
+    case TK_Int:
+    case TK_Float:
+    case TK_Void:
+    case TK_Bool:
+    case TK_Type: {
+      unreachable;
+      return false;
     }
     
-    ASTNode* curr = node->func.arg_types;
-    while (curr) {
-      hash ^= (u64) curr->constant_val.type_lit;
-      hash *= FNV_PRIME;
-      curr = curr->next;
-    }
-  } else {
-    if (node->func_type.return_type) {
-      hash ^= (u64) node->func_type.return_type->constant_val.type_lit;
-      hash *= FNV_PRIME;
-    } else {
-      hash ^= (u64) type_refs[Type_Index_Void];
-      hash *= FNV_PRIME;
+    case TK_Func: {
+      if (!CheckAbsolute(c, at->func_t.ret_t, bt->func_t.ret_t)) return false;
+      if (at->func_t.arity != bt->func_t.arity) return false;
+      for (u32 i = 0; i < at->func_t.arity; i++) {
+        if (!CheckAbsolute(c, at->func_t.arg_ts[i], bt->func_t.arg_ts[i]))
+          return false;
+      }
+      return true;
     }
     
-    ASTNode* curr = node->func_type.arg_types;
-    while (curr) {
-      hash ^= (u64) curr->constant_val.type_lit;
-      hash *= FNV_PRIME;
-      curr = curr->next;
+    case TK_Pointer: {
+      return CheckAbsolute(c, at->ptr_t.sub_t, bt->ptr_t.sub_t);
     }
-  }
-  return hash;
-}
-
-StableTable_Impl(ASTFuncRef, ValueTypeBucket, func_node_is_null, func_nodes_eq,
-                 hash_func);
-
-static b8 modded_type_key_is_null(ModdedTypeKey key) {
-  return memcmp(&key, &(ModdedTypeKey) {0}, sizeof(ModdedTypeKey));
-}
-static b8 modded_type_keys_eq(ModdedTypeKey a, ModdedTypeKey b) {
-  if (a.type != b.type) return false;
-  if (a.sub != b.sub) return false;
-  
-  switch (a.type) {
-    case MTK_None: return true;
-    case MTK_Pointer: return true;
-    case MTK_Array: return a.count == b.count;
-  }
-  
-  return false;
-}
-static u64 modded_type_key_hash(ModdedTypeKey key) {
-  u64 hash = FNV_OFFSET_BASIS;
-  hash ^= (u64) key.type;
-  hash *= FNV_PRIME;
-  hash ^= (u64) key.sub;
-  hash *= FNV_PRIME;
-  
-  switch (key.type) {
-    case MTK_None: break;
-    case MTK_Pointer: break;
-    case MTK_Array: {
-      hash ^= key.count;
-      hash *= FNV_PRIME;
-    } break;
-  }
-  
-  return hash;
-}
-StableTable_Impl(ModdedTypeKey, ModdedValueTypeBucket, modded_type_key_is_null, modded_type_keys_eq, modded_type_key_hash);
-
-
-static b8 compound_type_node_is_null(ASTNode* node) { return node == nullptr; }
-static b8 compound_type_nodes_eq(ASTNode* a, ASTNode* b) {
-  if (a->type != b->type) return false;
-  if (a->compound_type.member_count != b->compound_type.member_count) return false;
-  ASTNode* a_curr_type = a->compound_type.member_types;
-  ASTNode* b_curr_type = b->compound_type.member_types;
-  for (u64 i = 0; i < a->compound_type.member_count; i++) {
-    if (a_curr_type != b_curr_type) return false;
-    a_curr_type = a_curr_type->next;
-    b_curr_type = b_curr_type->next;
-  }
-  return true;
-}
-static u64 hash_compound_type_node(ASTNode* key) {
-  u64 hash = FNV_OFFSET_BASIS;
-  hash ^= (u64) key->type;
-  hash *= FNV_PRIME;
-  hash ^= key->compound_type.member_count;
-  hash *= FNV_PRIME;
-  ASTNode* curr_type = key->compound_type.member_types;
-  while (curr_type) {
-    hash ^= (u64) curr_type->constant_val.type_lit;
-    hash *= FNV_PRIME;
-    curr_type = curr_type->next;
-  }
-  return hash;
-}
-StableTable_Impl(ASTCompoundTypeRef, ValueTypeBucket, compound_type_node_is_null, compound_type_nodes_eq, hash_compound_type_node);
-
-static b8  ast_node_is_null(ASTNode* node) { return node == nullptr; }
-static b8  ast_nodes_eq(ASTNode* a, ASTNode* b) { return a == b; }
-static u64 hash_node(ASTNode* node) { return ((u64)node) * FNV_PRIME; }
-StableTable_Impl(ASTNodeRef, StringArrayBucket, ast_node_is_null, ast_nodes_eq,
-                 hash_node);
-
-DArray_Impl(Symbol);
-
-static b8 IdentifierLookup(Checker* checker, string id, u32* idx) {
-  for (i32 i = checker->symbols.len-1; i >= 0; i--) {
-    if (str_eq(checker->symbols.elems[i].ident.lexeme, id)) {
-      *idx = i;
+    
+    case TK_Array: {
+      return at->array_t.count == bt->array_t.count &&
+        CheckAbsolute(c, at->array_t.sub_t, bt->array_t.sub_t);
+    }
+    
+    case TK_Struct:
+    case TK_Union: {
+      if (at->compound_t.count != bt->compound_t.count) return false;
+      Token_node* acn = at->compound_t.member_names.first;
+      Token_node* bcn = bt->compound_t.member_names.first;
+      for (u64 i = 0; i < at->compound_t.count; i++) {
+        if (!str_eq(acn->token.lexeme, bcn->token.lexeme)) return false;
+        if (!CheckAbsolute(c, at->compound_t.member_ts[i], bt->compound_t.member_ts[i])) return false;
+        acn = acn->next;
+        bcn = bcn->next;
+      }
       return true;
     }
   }
   return false;
 }
 
-#define CheckAbsolute(a, b) ((a)==(b))
-//static b8 CheckAbsolute(ValueType* a, ValueType* b) {
-//if (a == b) return true;
-//return false;
-//}
+#define IsInteger(c, t) (TypeGet(c, t)->type == TK_Int)
+#define IsFloat(c, t) (TypeGet(c, t)->type == TK_Float)
+#define IsFunc(c, t) (TypeGet(c, t)->type == TK_Func)
+#define IsType(c, t) (TypeGet(c, t)->type == TK_Type)
+#define IsVoid(c, t) (TypeGet(c, t)->type == TK_Void)
+#define IsBool(c, t) (TypeGet(c, t)->type == TK_Bool)
+#define IsPointer(c, t) (TypeGet(c, t)->type == TK_Pointer)
+#define IsArray(c, t) (TypeGet(c, t)->type == TK_Array)
+#define IsStruct(c, t) (TypeGet(c, t)->type == TK_Struct)
+#define IsUnion(c, t) (TypeGet(c, t)->type == TK_Union)
 
+#define IsNotInteger(c, t) (TypeGet(c, t)->type != TK_Int)
+#define IsNotFloat(c, t) (TypeGet(c, t)->type != TK_Float)
+#define IsNotFunc(c, t) (TypeGet(c, t)->type != TK_Func)
+#define IsNotType(c, t) (TypeGet(c, t)->type != TK_Type)
+#define IsNotVoid(c, t) (TypeGet(c, t)->type != TK_Void)
+#define IsNotBool(c, t) (TypeGet(c, t)->type != TK_Bool)
+#define IsNotPointer(c, t) (TypeGet(c, t)->type != TK_Pointer)
+#define IsNotArray(c, t) (TypeGet(c, t)->type != TK_Array)
+#define IsNotStruct(c, t) (TypeGet(c, t)->type != TK_Struct)
+#define IsNotUnion(c, t) (TypeGet(c, t)->type != TK_Union)
 
+#define IsConstant(c, n) (n->is_constant)
+#define IsConstantInt(c, n) (IsConstant(c, n) && n->constant_val.type == CVT_Int)
+#define IsConstantFloat(c, n) (IsConstant(c, n) && n->constant_val.type == CVT_Float)
 
-typedef u32 ScopeResetPoint;
-ScopeResetPoint scope_push(Checker* checker) {
-  checker->scope += 1;
-  return checker->symbols.len;
-}
-void scope_pop(Checker* checker, ScopeResetPoint point) {
-  checker->scope -= 1;
-  checker->symbols.len = point;
-}
+#define GetConstantInt(n) ((n)->constant_val.int_lit)
+#define GetConstantFloat(n) ((n)->constant_val.float_lit)
+#define GetConstantType(n) ((n)->constant_val.type_lit)
 
+#define IsLValue(n) (n->type != NT_Expr_Deref &&\
+n->type != NT_Expr_Index &&\
+n->type != NT_Expr_Access &&\
+n->type != NT_Expr_Ident)
 
-static ValueType* reduce_type(ValueType* type) {
-  if (type->type == TK_Pointer) {
-    return type->ptr_t.sub_t;
-  } else if (type->type == TK_Array) {
-    return type->array_t.sub_t;
-  } else {
-    string ty = Debug_GetTypeString(global_arena_t, type);
-    LogError("Internal Compiler Error: Failed to reduce type '%.*s'", str_expand(ty));
-  }
-  return type_refs[Type_Index_None];
-}
-
-
-static ValueType* push_pointer_type(Checker* checker, ValueType* sub) {
-  ModdedTypeKey key = (ModdedTypeKey) {
-    .type  = MTK_Pointer,
-    .sub   = sub,
-  };
-  
-  ModdedValueTypeBucket* val;
-  if (!stable_table_get(ModdedTypeKey, ModdedValueTypeBucket, &checker->modded_type_cache, key, &val)) {
-    ModdedValueTypeBucket bucket = {0};
-    bucket.type = pool_alloc(&checker->allocator);
-    bucket.type->type = TK_Pointer;
-    bucket.type->ptr_t.sub_t = sub;
-    stable_table_set(ModdedTypeKey, ModdedValueTypeBucket, &checker->modded_type_cache, key, bucket);
-    return bucket.type;
-  }
-  
-  return val->type;
-}
-
-static ValueType* push_array_type(Checker* checker, ValueType* sub, u64 count) {
-  ModdedTypeKey key = (ModdedTypeKey) {
-    .type  = MTK_Array,
-    .sub   = sub,
-    .count = count,
-  };
-  
-  ModdedValueTypeBucket* val;
-  if (!stable_table_get(ModdedTypeKey, ModdedValueTypeBucket, &checker->modded_type_cache, key, &val)) {
-    ModdedValueTypeBucket bucket = {0};
-    bucket.type = pool_alloc(&checker->allocator);
-    bucket.type->type = TK_Array;
-    bucket.type->array_t.sub_t = sub;
-    bucket.type->array_t.count = count;
-    stable_table_set(ModdedTypeKey, ModdedValueTypeBucket, &checker->modded_type_cache, key, bucket);
-    
-    return bucket.type;
-  }
-  
-  return val->type;
-}
-
-static b8 is_lvalue(ASTNode* node) {
-  return node->type == NT_Expr_Deref ||
-    node->type == NT_Expr_Index ||
-    node->type == NT_Expr_Access ||
-    node->type == NT_Expr_Ident;
-}
-
-static b8 is_castable(ValueType* a, ValueType* b) {
+static b8 is_castable(Checker* c, ValueType* a, ValueType* b) {
   switch (b->type) {
+    case TK_Void:
+    case TK_Type: return false;
+    
+    case TK_None:
+    case TK_MAX:  unreachable; return false;
+    
     case TK_Int:
     case TK_Float: {
       return a->type == TK_Int || a->type == TK_Float;
@@ -300,7 +199,7 @@ static b8 is_castable(ValueType* a, ValueType* b) {
       if (a->type != b->type) return false;
       if (a->compound_t.count != b->compound_t.count) return false;
       for (u64 i = 0; i < a->compound_t.count; i++) {
-        if (!CheckAbsolute(a->compound_t.member_ts[i], b->compound_t.member_ts[i]))
+        if (!CheckAbsolute(c, a->compound_t.member_ts[i], b->compound_t.member_ts[i]))
           return false;
       }
       return true;
@@ -310,108 +209,132 @@ static b8 is_castable(ValueType* a, ValueType* b) {
   return false;
 }
 
-//~ Helpers
+static TypeIndex type_reduce(Checker* c, TypeIndex t) {
+  ValueType* ty = TypeGet(c, t);
+  if (ty->type == TK_Pointer) {
+    return ty->ptr_t.sub_t;
+  } else if (ty->type == TK_Array) {
+    return ty->array_t.sub_t;
+  } else if (ty->type == TK_Func) {
+    return ty->func_t.ret_t;
+  }
+  unreachable;
+  return -1;
+}
 
-static void Checker_CheckNode(Checker* checker, ASTNode* node);
-static void Checker_CheckOuter(Checker* checker, ASTNode* node);
+static TypeIndex type_push_pointer(Checker* c, TypeIndex t) {
+  ValueType* reg = pool_alloc(&c->allocator);
+  reg->type = TK_Pointer;
+  reg->ptr_t.sub_t = t;
+  darray_add(ValueTypeRef, &c->type_cache, reg);
+  return c->type_cache.len-1;
+}
 
-#define CheckerReturnIfIdentDNF(c) if (c->ident_dnf && !c->scope) return;
-#define CheckerAssertion(c, cond) if (!c->ident_dnf && (cond))
-#define CheckerSetCurrentStatement(c, n) Statement(\
-c->curr_stmt = n;\
-c->ident_dnf = false;\
-)
+static TypeIndex type_push_array(Checker* c, TypeIndex t, u64 count) {
+  ValueType* reg = pool_alloc(&c->allocator);
+  reg->type = TK_Array;
+  reg->array_t.sub_t = t;
+  reg->array_t.count = count;
+  darray_add(ValueTypeRef, &c->type_cache, reg);
+  return c->type_cache.len-1;
+}
 
-static void Checker_CheckInner(Checker* checker, ASTNode* node) {
+DArray_Impl(Symbol);
+
+static b8 symbol_lookup(darray(Symbol) syms, string id, u32 min_scope, u32* idx) {
+  for (i32 i = syms.len-1; i >= 0; i--) {
+    if (syms.elems[i].scope < min_scope) break;
+    if (str_eq(syms.elems[i].ident.lexeme, id)) {
+      if (idx) *idx = i;
+      return true;
+    }
+  }
+  return false;
+}
+
+//~ Error Stuff
+
+static b8 Checker_RunDFS(darray(ASTNodeRef_array)* adj, u32 i, i32* start, i32* end) {
+  adj->elems[i].elems[0]->decl.color = 1;
+  for (u32 j = 1; j < adj->elems[i].len; j++) {
+    i32 curr_dep = -1;
+    ASTNode* theone = adj->elems[i].elems[j];
+    for (u32 k = 0; k < adj->len; k++) {
+      if (adj->elems[k].elems[0] == theone) {
+        curr_dep = k;
+        break;
+      }
+    }
+    if (curr_dep == -1) return false;
+    
+    if (adj->elems[curr_dep].elems[0]->decl.color == 0) {
+      adj->elems[curr_dep].elems[0]->decl.parent = i;
+      if (Checker_RunDFS(adj, curr_dep, start, end))
+        return true;
+    } else if (adj->elems[curr_dep].elems[0]->decl.color == 1) {
+      *start = curr_dep;
+      *end = i;
+      return true;
+    }
+  }
+  adj->elems[i].elems[0]->decl.color = 2;
+  return false;
+}
+
+static void Checker_DetectCycles(Checker* c, darray(ASTNodeRef_array)* adj) {
+  i32 cy_start = -1;
+  i32 cy_end = -1;
+  IteratePtr (adj, i) {
+    if (!adj->elems[i].elems[0]->decl.color &&
+        Checker_RunDFS(adj, i, &cy_start, &cy_end))
+      break;
+  }
+  
+  if (cy_start == -1 || cy_end == -1) return;
+  
+  CheckerErrorNoRet(c, ((Token){0}), "Found a Dependency Cycle:\n");
+  ASTNode* curr = adj->elems[cy_end].elems[0];
+  u32 index = 0;
+  ASTNode* prev = adj->elems[cy_end].elems[0];
+  while (true) {
+    if (curr != prev)
+      CheckerErrorNoRet(c, curr->marker, "%u) %.*s -> %.*s\n", index, str_expand(prev->decl.ident.lexeme), str_expand(curr->decl.ident.lexeme));
+    else
+      CheckerErrorNoRet(c, curr->marker, "%u) Starting here: %.*s\n", index,
+                        str_expand(curr->decl.ident.lexeme));
+    
+    index += 1;
+    if (curr->decl.parent == -1) break;
+    
+    prev = curr;
+    curr = adj->elems[curr->decl.parent].elems[0];
+  }
+  CheckerErrorNoRet(c, curr->marker, "%u) %.*s -> %.*s\n", index,
+                    str_expand(curr->decl.ident.lexeme),
+                    str_expand(adj->elems[cy_end].elems[0]->decl.ident.lexeme));
+}
+
+static void Checker_ErrorsBuild(Checker* c, ASTNode* base, ASTNode* node) {
   if (!node) return;
   
   switch (node->type) {
-    case NT_Expr_Func: {
-      Checker_CheckInner(checker, node->func.return_type);
-      
-      ScopeResetPoint sp = scope_push(checker);
-      
-      ASTNode* curr = node->func.arg_types;
-      Token_node* curr_name = node->func.arg_names.first;
-      
-      while (curr) {
-        Checker_CheckInner(checker, curr);
-        
-        Symbol k = (Symbol) {
-          .ident = curr_name->token,
-          .scope = checker->scope,
-          .type = curr->constant_val.type_lit,
-          .is_constant = node->decl.is_constant,
-        };
-        darray_add(Symbol, &checker->symbols, k);
-        
-        curr = curr->next;
-        curr_name = curr_name->next;
-      }
-      
-      Checker_CheckNode(checker, node->func.body);
-      
-      scope_pop(checker, sp);
-    } break;
-    
-    case NT_Stmt_Block: {
-      ASTNode* curr = node->block;
-      
-      ScopeResetPoint sp = scope_push(checker);
-      while (curr) {
-        Checker_CheckNode(checker, curr);
-        curr = curr->next;
-      }
-      scope_pop(checker, sp);
-    } break;
-    
-    case NT_Stmt_While: {
-      Checker_CheckInner(checker, node->while_loop.condition);
-      ASTNode* curr = node->while_loop.body;
-      
-      ScopeResetPoint sp = scope_push(checker);
-      while (curr) {
-        Checker_CheckNode(checker, curr);
-        curr = curr->next;
-      }
-      scope_pop(checker, sp);
-    } break;
-    
-    case NT_Stmt_If: {
-      Checker_CheckInner(checker, node->if_stmt.condition);
-      
-      ScopeResetPoint sp = scope_push(checker);
-      Checker_CheckNode(checker, node->if_stmt.then_body);
-      scope_pop(checker, sp);
-      
-      if (node->if_stmt.else_body) {
-        ScopeResetPoint sp = scope_push(checker);
-        Checker_CheckNode(checker, node->if_stmt.else_body);
-        scope_pop(checker, sp);
-      }
-    } break;
-    
     case NT_Error:
     case NT_Expr_IntLit:
-    case NT_Expr_FloatLit: {
-    } break;
+    case NT_Expr_FloatLit: {} break;
     
     case NT_Expr_Add:
     case NT_Expr_Sub:
     case NT_Expr_Mul:
-    case NT_Expr_Div: {
-      Checker_CheckInner(checker, node->binary_op.left);
-      Checker_CheckInner(checker, node->binary_op.right);
-    } break;
-    
+    case NT_Expr_Div:
     case NT_Expr_Mod: {
-      Checker_CheckInner(checker, node->binary_op.left);
-      Checker_CheckInner(checker, node->binary_op.right);
+      Checker_ErrorsBuild(c, base, node->binary_op.left);
+      Checker_ErrorsBuild(c, base, node->binary_op.right);
     } break;
     
     case NT_Expr_Identity:
-    case NT_Expr_Negate: {
-      Checker_CheckInner(checker, node->unary_op.operand);
+    case NT_Expr_Negate:
+    case NT_Expr_Not: {
+      Checker_ErrorsBuild(c, base, node->unary_op.operand);
     } break;
     
     case NT_Expr_Eq:
@@ -420,150 +343,560 @@ static void Checker_CheckInner(Checker* checker, ASTNode* node) {
     case NT_Expr_Greater:
     case NT_Expr_LessEq:
     case NT_Expr_GreaterEq: {
-      Checker_CheckInner(checker, node->binary_op.left);
-      Checker_CheckInner(checker, node->binary_op.right);
+      Checker_ErrorsBuild(c, base, node->binary_op.left);
+      Checker_ErrorsBuild(c, base, node->binary_op.right);
+    } break;
+    
+    case NT_Expr_FuncProto: {
+      Checker_ErrorsBuild(c, base, node->proto.return_type);
+      ASTNode* ct = node->proto.arg_types;
+      while (ct) {
+        Checker_ErrorsBuild(c, base, ct);
+        ct = ct->next;
+      }
+    } break;
+    
+    case NT_Expr_Func: {
+      Checker_ErrorsBuild(c, base, node->func.proto);
+      Checker_ErrorsBuild(c, base, node->func.body);
+    } break;
+    
+    case NT_Expr_Index: {
+      Checker_ErrorsBuild(c, base, node->index.left);
+      Checker_ErrorsBuild(c, base, node->index.idx);
+    } break;
+    
+    case NT_Expr_Addr: {
+      Checker_ErrorsBuild(c, base, node->addr);
+    } break;
+    
+    case NT_Expr_Deref: {
+      Checker_ErrorsBuild(c, base, node->deref);
     } break;
     
     case NT_Expr_Call: {
-      Checker_CheckInner(checker, node->call.called);
-      ASTNode* curr = node->call.args;
-      while (curr) {
-        Checker_CheckInner(checker, curr);
-        curr = curr->next;
+      Checker_ErrorsBuild(c, base, node->call.called);
+      ASTNode* ca = node->call.args;
+      while (ca) {
+        Checker_ErrorsBuild(c, base, ca);
+        ca = ca->next;
       }
     } break;
     
     case NT_Expr_Ident: {
-    } break;
-    
-    case NT_Expr_Index: {
-      Checker_CheckInner(checker, node->index.left);
-      Checker_CheckInner(checker, node->index.idx);
-    } break;
-    
-    case NT_Expr_Deref: {
-      Checker_CheckInner(checker, node->deref);
-    } break;
-    
-    case NT_Expr_Addr: {
-      Checker_CheckInner(checker, node->addr);
-    } break;
-    
-    case NT_Expr_Not: {
-      Checker_CheckInner(checker, node->unary_op.operand);
+      if (node->status & Status_Waiting) {
+        // Failed Identifier Lookup
+        ASTNode* top_level = c->tree;
+        b8 exists = false;
+        while (top_level) {
+          if (str_eq(top_level->decl.ident.lexeme, node->ident.lexeme)) {
+            exists = true;
+            break;
+          }
+          top_level = top_level->next;
+        }
+        
+        if (exists) {
+          // Since this exists in the top level, there HAS to be a cycle.
+          b8 did_something = false;
+          
+          Iterate (c->cycle_checker, i) {
+            darray(ASTNodeRef)* curr_cycle = &c->cycle_checker.elems[i];
+            
+            if (curr_cycle->elems[0] == base) {
+              darray_add(ASTNodeRef, curr_cycle, top_level);
+              did_something = true;
+            }
+          }
+          
+          if (!did_something) {
+            darray(ASTNodeRef) newguy = {0};
+            darray_add(ASTNodeRef, &newguy, base);
+            darray_add(ASTNodeRef, &newguy, top_level);
+            darray_add(ASTNodeRef_array, &c->cycle_checker, newguy);
+          }
+          
+          c->cycles_exist = true;
+        } else {
+          CheckerErrorNoRet(c, node->marker, "Undeclared Identifier '%.*s'\n",
+                            str_expand(node->ident.lexeme));
+        }
+      }
     } break;
     
     case NT_Expr_Cast: {
-      Checker_CheckInner(checker, node->cast.casted);
-      Checker_CheckInner(checker, node->cast.type);
+      Checker_ErrorsBuild(c, base, node->cast.casted);
+      Checker_ErrorsBuild(c, base, node->cast.type);
     } break;
     
     case NT_Expr_Access: {
+      Checker_ErrorsBuild(c, base, node->access.left);
+    } break;
+    
+    case NT_Type_Integer:
+    case NT_Type_Float:
+    case NT_Type_Void: {} break;
+    
+    case NT_Type_Func: {
+      Checker_ErrorsBuild(c, base, node->func_type.return_type);
+      ASTNode* ct = node->func_type.arg_types;
+      while (ct) {
+        Checker_ErrorsBuild(c, base, ct);
+        ct = ct->next;
+      }
+    } break;
+    
+    case NT_Type_Struct:
+    case NT_Type_Union: {
+      ASTNode* ct = node->compound_type.member_types;
+      while (ct) {
+        Checker_ErrorsBuild(c, base, ct);
+        ct = ct->next;
+      }
+    } break;
+    
+    case NT_Type_Pointer: {
+      Checker_ErrorsBuild(c, base, node->pointer_type.sub);
+    } break;
+    
+    case NT_Type_Array: {
+      Checker_ErrorsBuild(c, base, node->array_type.count);
+      Checker_ErrorsBuild(c, base, node->array_type.sub);
+    } break;
+    
+    case NT_Stmt_Assign: {
+      Checker_ErrorsBuild(c, base, node->binary_op.left);
+      Checker_ErrorsBuild(c, base, node->binary_op.right);
+    } break;
+    
+    case NT_Stmt_Expr: {
+      Checker_ErrorsBuild(c, base, node->expr_stmt);
+    } break;
+    
+    case NT_Stmt_Block: {
+      ASTNode* in = node->block;
+      while (in) {
+        Checker_ErrorsBuild(c, base, in);
+        in = in->next;
+      }
+    } break;
+    
+    case NT_Stmt_While: {
+      Checker_ErrorsBuild(c, base, node->while_loop.condition);
+      Checker_ErrorsBuild(c, base, node->while_loop.body);
+    } break;
+    
+    case NT_Stmt_If: {
+      Checker_ErrorsBuild(c, base, node->if_stmt.condition);
+      Checker_ErrorsBuild(c, base, node->if_stmt.then_body);
+      Checker_ErrorsBuild(c, base, node->if_stmt.else_body);
+    } break;
+    
+    case NT_Stmt_Return: {
+      Checker_ErrorsBuild(c, base, node->return_stmt);
+    } break;
+    
+    case NT_Decl: {
+      Checker_ErrorsBuild(c, base, node->decl.type);
+      Checker_ErrorsBuild(c, base, node->decl.val);
+    } break;
+  }
+}
+
+
+//~ Main Functions
+
+static void Checker_Transfer(Checker* c, ASTNode* node);
+
+#define CheckerIf(c, cond) if (cond)
+#define ReturnIfError(c) if (c->errored) return;
+#define ReadyStat(cond) ((cond) ? Status_Ready : 0)
+#define ProtoReadyStat(cond) ((cond) ? Status_ProtoReady : 0)
+
+static b8 Checker_IsReady(Checker* c, ASTNode* base, ASTNode* curr) {
+  if (!curr) return true;
+  if (curr->status & Status_Ready) return true;
+  
+  switch (curr->type) {
+    case NT_Error:
+    case NT_Expr_IntLit:
+    case NT_Expr_FloatLit: {
+      curr->status |= Status_Ready;
+      curr->status |= Status_ProtoReady;
+    } break;
+    
+    case NT_Expr_Add:
+    case NT_Expr_Sub:
+    case NT_Expr_Mul:
+    case NT_Expr_Div:
+    case NT_Expr_Mod: {
+      b8 stat =
+        Checker_IsReady(c, base, curr->binary_op.left) &
+        Checker_IsReady(c, base, curr->binary_op.right);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Identity:
+    case NT_Expr_Negate:
+    case NT_Expr_Not: {
+      b8 stat = Checker_IsReady(c, base, curr->unary_op.operand);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Eq:
+    case NT_Expr_Neq:
+    case NT_Expr_Less:
+    case NT_Expr_Greater:
+    case NT_Expr_LessEq:
+    case NT_Expr_GreaterEq: {
+      b8 stat =
+        Checker_IsReady(c, base, curr->binary_op.left) &
+        Checker_IsReady(c, base, curr->binary_op.right);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_FuncProto: {
+      b8 stat = Checker_IsReady(c, base, curr->proto.return_type);
+      ASTNode* ct = curr->proto.arg_types;
+      while (ct) {
+        stat &= Checker_IsReady(c, base, ct);
+        ct = ct->next;
+      }
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Func: {
+      b8 protostat = Checker_IsReady(c, base, curr->func.proto);
+      b8 stat = Checker_IsReady(c, base, curr->func.body);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(protostat);
+    } break;
+    
+    case NT_Expr_Index: {
+      b8 stat =
+        Checker_IsReady(c, base, curr->index.left) &
+        Checker_IsReady(c, base, curr->index.idx);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Addr: {
+      b8 stat = Checker_IsReady(c, base, curr->addr);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Deref: {
+      b8 stat = Checker_IsReady(c, base, curr->deref);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Call: {
+      Checker_IsReady(c, base, curr->call.called);
+      b8 stat = (curr->call.called->status & Status_ProtoReady);
       
+      ASTNode* ca = curr->call.args;
+      while (ca) {
+        stat &= Checker_IsReady(c, base, ca);
+        ca = ca->next;
+      }
+      
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Ident: {
+      u32 idx;
+      if (!symbol_lookup(c->symbols, curr->ident.lexeme, 0, &idx)) {
+        curr->status |= Status_Waiting;
+        break;
+      }
+      
+      curr->status |= (c->symbols.elems[idx].node->status & Status_Ready);
+      curr->status |= (c->symbols.elems[idx].node->status & Status_ProtoReady);
+      if (!(curr->status & Status_Ready || curr->status & Status_ProtoReady))
+        curr->status |= Status_Waiting;
+    } break;
+    
+    case NT_Expr_Cast: {
+      b8 stat =
+        Checker_IsReady(c, base, curr->cast.casted) &
+        Checker_IsReady(c, base, curr->cast.type);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Expr_Access: {
+      Checker_IsReady(c, base, curr->access.left);
+      b8 stat = curr->access.left->status & Status_ProtoReady;
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
     } break;
     
     case NT_Type_Integer:
     case NT_Type_Float:
     case NT_Type_Void: {
+      b8 stat = true;
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
     } break;
     
     case NT_Type_Func: {
-      Checker_CheckInner(checker, node->func_type.return_type);
-      ASTNode* curr = node->func_type.arg_types;
-      while (curr) {
-        Checker_CheckInner(checker, curr);
-        curr = curr->next;
+      b8 stat = Checker_IsReady(c, base, curr->func_type.return_type);
+      ASTNode* ct = curr->func_type.arg_types;
+      while (ct) {
+        stat &= Checker_IsReady(c, base, ct);
+        ct = ct->next;
       }
-    } break;
-    
-    case NT_Type_Pointer: {
-      Checker_CheckInner(checker, node->pointer_type.sub);
-    } break;
-    
-    case NT_Type_Array: {
-      Checker_CheckInner(checker, node->array_type.sub);
-      Checker_CheckInner(checker, node->array_type.count);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
     } break;
     
     case NT_Type_Struct:
     case NT_Type_Union: {
-      ASTNode* curr = node->compound_type.member_types;
-      while (curr) {
-        Checker_CheckInner(checker, curr);
-        curr = curr->next;
+      b8 stat = true;
+      ASTNode* ct = curr->compound_type.member_types;
+      while (ct) {
+        stat &= Checker_IsReady(c, base, ct);
+        ct = ct->next;
       }
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Type_Pointer: {
+      //b8 stat = Checker_IsReady(c, base, curr->pointer_type.sub);
+      //curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+      curr->status |= Status_Ready | Status_ProtoReady;
+    } break;
+    
+    case NT_Type_Array: {
+      b8 stat =
+        Checker_IsReady(c, base, curr->array_type.count) &
+        Checker_IsReady(c, base, curr->array_type.sub);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
     } break;
     
     case NT_Stmt_Assign: {
-      Checker_CheckInner(checker, node->binary_op.left);
-      Checker_CheckInner(checker, node->binary_op.right);
+      b8 stat =
+        Checker_IsReady(c, base, curr->binary_op.left) &
+        Checker_IsReady(c, base, curr->binary_op.right);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
     } break;
     
     case NT_Stmt_Expr: {
-      Checker_CheckInner(checker, node->expr_stmt);
+      b8 stat = Checker_IsReady(c, base, curr->expr_stmt);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Stmt_Block: {
+      b8 stat = true;
+      ASTNode* in = curr->block;
+      ScopeResetPoint p = scope_push(c);
+      while (in) {
+        stat &= Checker_IsReady(c, base, in);
+        in = in->next;
+      }
+      scope_pop(c, p);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Stmt_While: {
+      b8 stat = Checker_IsReady(c, base, curr->while_loop.condition);
+      ScopeResetPoint p = scope_push(c);
+      stat &= Checker_IsReady(c, base, curr->while_loop.body);
+      scope_pop(c, p);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
+    } break;
+    
+    case NT_Stmt_If: {
+      b8 stat = Checker_IsReady(c, base, curr->if_stmt.condition);
+      
+      ScopeResetPoint p = scope_push(c);
+      stat &= Checker_IsReady(c, base, curr->if_stmt.then_body);
+      scope_pop(c, p);
+      
+      p = scope_push(c);
+      stat &= Checker_IsReady(c, base, curr->if_stmt.else_body);
+      scope_pop(c, p);
+      
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
     } break;
     
     case NT_Stmt_Return: {
-      Checker_CheckInner(checker, node->return_stmt);
+      b8 stat = Checker_IsReady(c, base, curr->return_stmt);
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(stat);
     } break;
     
     case NT_Decl: {
-      Checker_CheckInner(checker, node->decl.type);
-      Checker_CheckInner(checker, node->decl.val);
+      b8 stat = Checker_IsReady(c, base, curr->decl.type);
+      b8 protostat = stat;
+      
+      Symbol reg = (Symbol) {
+        .ident = curr->decl.ident,
+        .scope = c->scope,
+        .node = curr,
+      };
+      darray_add(Symbol, &c->symbols, reg);
+      
+      ScopeResetPoint p = scope_push(c);
+      stat &= Checker_IsReady(c, base, curr->decl.val);
+      scope_pop(c, p);
+      
+      if (curr->decl.val)
+        protostat &= (curr->decl.val->status & Status_ProtoReady ? 1 : 0);
+      
+      curr->status |= ReadyStat(stat) | ProtoReadyStat(protostat);
     } break;
-    
-    default: { } break;
   }
+  
+  return !!(curr->status & Status_Ready);
 }
 
-static void Checker_CheckOuter(Checker* checker, ASTNode* node) {
+
+static void Checker_ProtoTransfer(Checker* c, ASTNode* node) {
   if (!node) return;
+  if ((node->status & Status_Resolved) ||
+      (node->status & Status_ProtoResolved)) return;
   
   switch (node->type) {
-    case NT_Error: node->expr_type = type_refs[Type_Index_None]; break;
-    case NT_Expr_IntLit: node->expr_type = type_refs[Type_Index_I32]; break;
-    case NT_Expr_FloatLit: node->expr_type = type_refs[Type_Index_F32]; break;
+    case NT_Expr_FuncProto: {
+      Checker_Transfer(c, node->proto.return_type);
+      ASTNode* curr = node->proto.arg_types;
+      while (curr) {
+        Checker_Transfer(c, curr);
+        curr = curr->next;
+      }
+      ReturnIfError(c);
+      
+      CheckerIf (c,
+                 IsNotType(c, node->proto.return_type->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->proto.return_type->expr_type);
+        CheckerError(c, node->marker,
+                     "Return type must actually be a type, but we got '%.*s'\n",
+                     str_expand(t1));
+      }
+      
+      curr = node->proto.arg_types;
+      u32 i = 0;
+      while (curr) {
+        CheckerIf (c,
+                   IsNotType(c, curr->expr_type)) {
+          string t1 =
+            Debug_GetTypeString(c, curr->expr_type);
+          CheckerError(c, node->marker,
+                       "Argument %u must be a type, but we got '%.*s'\n",
+                       i, str_expand(t1));
+        }
+        i++;
+        curr = curr->next;
+      }
+      
+      ValueType* reg = pool_alloc(&c->allocator);
+      reg->type = TK_Func;
+      reg->func_t.ret_t = node->proto.return_type->expr_type;
+      reg->func_t.arity = node->proto.arity;
+      reg->func_t.arg_ts = arena_alloc(&c->arena, sizeof(TypeIndex) * node->proto.arity);
+      curr = node->proto.arg_types;
+      i = 0;
+      while (curr) {
+        reg->func_t.arg_ts[i] = curr->constant_val.type_lit;
+        i++;
+        curr = curr->next;
+      }
+      darray_add(ValueTypeRef, &c->type_cache, reg);
+      
+      node->expr_type = c->type_cache.len-1;
+      node->status |= Status_Resolved;
+    } break;
+    
+    case NT_Expr_Func: {
+      Checker_Transfer(c, node->func.proto);
+      
+      ReturnIfError(c);
+      
+      node->expr_type = node->func.proto->expr_type;
+    } break;
+    
+    case NT_Decl: {
+      Checker_Transfer(c, node->decl.type);
+      Checker_ProtoTransfer(c, node->decl.val);
+      
+      if (symbol_lookup(c->symbols, node->decl.ident.lexeme, c->scope, nullptr)) {
+        CheckerError(c, node->decl.ident,
+                     "Redeclared Identifier '%.*s'\n",
+                     str_expand(node->decl.ident.lexeme));
+      }
+      
+      Symbol reg = (Symbol) {
+        .ident = node->decl.ident,
+        .node = node,
+        .scope = c->scope,
+      };
+      
+      if (node->decl.type) {
+        reg.type = node->decl.type->constant_val.type_lit;
+      } else {
+        reg.type = node->decl.val->expr_type;
+      }
+      
+      darray_add(Symbol, &c->symbols, reg);
+    } break;
+    
+    default: break;
+  }
+  
+  node->status |= Status_ProtoResolved;
+}
+
+static void Checker_Transfer(Checker* c, ASTNode* node) {
+  if (!node) return;
+  if (node->status & Status_Resolved) return;
+  
+  switch (node->type) {
+    case NT_Error: {
+      node->expr_type = Type_Index_None;
+    } break;
+    
+    case NT_Expr_IntLit: {
+      node->expr_type = Type_Index_I32;
+    } break;
+    
+    case NT_Expr_FloatLit: {
+      node->expr_type = Type_Index_F32;
+    } break;
     
     case NT_Expr_Add:
     case NT_Expr_Sub:
     case NT_Expr_Mul:
     case NT_Expr_Div: {
-      Checker_CheckOuter(checker, node->binary_op.left);
-      Checker_CheckOuter(checker, node->binary_op.right);
-      CheckerReturnIfIdentDNF(checker);
+      Checker_Transfer(c, node->binary_op.left);
+      Checker_Transfer(c, node->binary_op.right);
+      ReturnIfError(c);
       
-      CheckerAssertion(checker, !CheckAbsolute(node->binary_op.left->expr_type, node->binary_op.right->expr_type)) {
-        string left  = Debug_GetTypeString(&checker->arena, node->binary_op.left->expr_type);
-        string right = Debug_GetTypeString(&checker->arena, node->binary_op.right->expr_type);
-        CheckerError(checker, node->marker, "The LHS and RHS for the binary operator should have the same types, but we got %.*s and %.*s instead\n",
-                     str_expand(left), str_expand(right));
+      // TODO(voxel): Check If you can widen implicitly
+      CheckerIf (c,
+                 !CheckAbsolute(c, node->binary_op.left->expr_type,
+                                node->binary_op.right->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->binary_op.left->expr_type);
+        string t2 =
+          Debug_GetTypeString(c, node->binary_op.right->expr_type);
+        CheckerError(c, node->marker,
+                     "LHS and RHS of the binary operator should be the same type, but we got '%.*s' and '%.*s'\n",
+                     str_expand(t1), str_expand(t2));
       }
       
       node->expr_type = node->binary_op.left->expr_type;
     } break;
     
     case NT_Expr_Mod: {
-      Checker_CheckOuter(checker, node->binary_op.left);
-      Checker_CheckOuter(checker, node->binary_op.right);
-      CheckerReturnIfIdentDNF(checker);
+      Checker_Transfer(c, node->binary_op.left);
+      Checker_Transfer(c, node->binary_op.right);
+      ReturnIfError(c);
       
-      CheckerAssertion(checker, !CheckAbsolute(node->binary_op.left->expr_type, node->binary_op.right->expr_type)) {
-        string left  = Debug_GetTypeString(&checker->arena, node->binary_op.left->expr_type);
-        string right = Debug_GetTypeString(&checker->arena, node->binary_op.right->expr_type);
-        CheckerError(checker, node->marker, "The LHS and RHS for the binary operator should have the same types, but we got %.*s and %.*s instead\n",
-                     str_expand(left), str_expand(right));
-      }
-      
-      CheckerAssertion(checker, CheckAbsolute(node->binary_op.left->expr_type, type_refs[Type_Index_F32])) {
-        string left  = Debug_GetTypeString(&checker->arena, node->binary_op.left->expr_type);
-        CheckerError(checker, node->marker, "The type %.*s should not be a float",
-                     str_expand(left));
-      }
-      
-      CheckerAssertion(checker, CheckAbsolute(node->binary_op.left->expr_type, type_refs[Type_Index_F64])) {
-        string left  = Debug_GetTypeString(&checker->arena, node->binary_op.left->expr_type);
-        CheckerError(checker, node->marker, "The type %.*s should not be a float",
-                     str_expand(left));
+      CheckerIf (c,
+                 IsNotInteger(c, node->binary_op.left->expr_type) ||
+                 IsNotInteger(c, node->binary_op.right->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->binary_op.left->expr_type);
+        string t2 =
+          Debug_GetTypeString(c, node->binary_op.right->expr_type);
+        CheckerError(c, node->marker,
+                     "LHS and RHS of %% should be integers but we got '%.*s' and '%.*s'\n",
+                     str_expand(t1), str_expand(t2));
       }
       
       node->expr_type = node->binary_op.left->expr_type;
@@ -571,17 +904,37 @@ static void Checker_CheckOuter(Checker* checker, ASTNode* node) {
     
     case NT_Expr_Identity:
     case NT_Expr_Negate: {
-      Checker_CheckOuter(checker, node->unary_op.operand);
-      CheckerReturnIfIdentDNF(checker);
+      Checker_Transfer(c, node->unary_op.operand);
+      ReturnIfError(c);
+      
+      CheckerIf (c,
+                 IsNotInteger(c, node->unary_op.operand->expr_type) &&
+                 IsNotFloat(c, node->unary_op.operand->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->unary_op.operand->expr_type);
+        CheckerError(c, node->marker,
+                     "This operator is not supported by the type '%.*s'\n",
+                     str_expand(t1));
+      }
       
       node->expr_type = node->unary_op.operand->expr_type;
     } break;
     
     case NT_Expr_Not: {
-      Checker_CheckOuter(checker, node->unary_op.operand);
-      CheckerReturnIfIdentDNF(checker);
+      Checker_Transfer(c, node->unary_op.operand);
+      ReturnIfError(c);
       
-      node->expr_type = type_refs[Type_Index_Bool];
+      CheckerIf (c,
+                 IsNotInteger(c, node->unary_op.operand->expr_type) &&
+                 IsNotFloat(c, node->unary_op.operand->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->unary_op.operand->expr_type);
+        CheckerError(c, node->marker,
+                     "This operator is not supported by the type '%.*s'\n",
+                     str_expand(t1));
+      }
+      
+      node->expr_type = node->unary_op.operand->expr_type;
     } break;
     
     case NT_Expr_Eq:
@@ -590,197 +943,194 @@ static void Checker_CheckOuter(Checker* checker, ASTNode* node) {
     case NT_Expr_Greater:
     case NT_Expr_LessEq:
     case NT_Expr_GreaterEq: {
-      Checker_CheckOuter(checker, node->binary_op.left);
-      Checker_CheckOuter(checker, node->binary_op.right);
-      CheckerReturnIfIdentDNF(checker);
+      Checker_Transfer(c, node->binary_op.left);
+      Checker_Transfer(c, node->binary_op.right);
+      ReturnIfError(c);
       
-      CheckerAssertion(checker, !CheckAbsolute(node->binary_op.left->expr_type, node->binary_op.right->expr_type)) {
-        string left  = Debug_GetTypeString(&checker->arena, node->binary_op.left->expr_type);
-        string right = Debug_GetTypeString(&checker->arena, node->binary_op.right->expr_type);
-        CheckerError(checker, node->marker, "The LHS and RHS for the binary operator should have the same types, but we got %.*s and %.*s instead\n",
-                     str_expand(left), str_expand(right));
-      }
-      node->expr_type = type_refs[Type_Index_Bool];
-    } break;
-    
-    case NT_Expr_Func: {
-      Checker_CheckOuter(checker, node->func.return_type);
-      
-      ASTNode* curr = node->func.arg_types;
-      
-      while (curr) {
-        Checker_CheckOuter(checker, curr);
-        CheckerAssertion(checker, !CheckAbsolute(curr->expr_type, type_refs[Type_Index_Type])) {
-          string typ = Debug_GetTypeString(&checker->arena, curr->expr_type);
-          CheckerError(checker, curr->marker, "Required a type for the parameter but got a '%.*s' instead\n",
-                       str_expand(typ));
-        }
-        
-        curr = curr->next;
+      CheckerIf (c,
+                 !CheckAbsolute(c, node->binary_op.left->expr_type,
+                                node->binary_op.right->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->binary_op.left->expr_type);
+        string t2 =
+          Debug_GetTypeString(c, node->binary_op.right->expr_type);
+        CheckerError(c, node->marker,
+                     "LHS and RHS of the binary operator should be the same type, but we got '%.*s' and '%.*s'\n",
+                     str_expand(t1), str_expand(t2));
       }
       
-      CheckerReturnIfIdentDNF(checker);
-      
-      ValueTypeBucket* ty = {0};
-      if (stable_table_get(ASTFuncRef, ValueTypeBucket, &checker->func_type_cache,
-                           node, &ty))  {
-        node->expr_type = ty->type;
-        return;
-      }
-      
-      
-      ValueTypeBucket bucket = {0};
-      bucket.type = pool_alloc(&checker->allocator);
-      bucket.type->type = TK_Func;
-      bucket.type->func_t.ret_t = node->func.return_type->constant_val.type_lit;
-      bucket.type->func_t.arg_ts =
-        arena_alloc(&checker->arena, sizeof(ValueType*) * node->func.arity);
-      bucket.type->func_t.arity = node->func.arity;
-      
-      curr = node->func.arg_types;
-      for (int i = 0; i < node->func.arity; i++) {
-        bucket.type->func_t.arg_ts[i] = curr->constant_val.type_lit;
-        curr = curr->next;
-      }
-      
-      stable_table_set(ASTFuncRef, ValueTypeBucket, &checker->func_type_cache,
-                       node, bucket);
-      node->expr_type = bucket.type;
-      
-    } break;
-    
-    case NT_Expr_Call: {
-      Checker_CheckOuter(checker, node->call.called);
-      ASTNode* curr = node->call.args;
-      while (curr) {
-        Checker_CheckOuter(checker, curr);
-        curr = curr->next;
-      }
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, node->call.called->expr_type->type != TK_Func) {
-        string called_fn_type = Debug_GetTypeString(&checker->arena, node->call.called->expr_type);
-        CheckerError(checker, node->marker, "Called expression is not a function, it is a %.*s\n",
-                     str_expand(called_fn_type));
-      }
-      
-      CheckerAssertion(checker, node->call.called->expr_type->func_t.arity != node->call.arity) {
-        CheckerError(checker, node->marker, "Number of arguments required (%d) for the function and the number of arguments you provided (%d) are not equal\n",
-                     node->call.called->expr_type->func_t.arity,
-                     node->call.arity);
-      }
-      curr = node->call.args;
-      for (int i = 0; i < node->call.called->expr_type->func_t.arity; i++) {
-        CheckerAssertion(checker, !CheckAbsolute(node->call.called->expr_type->func_t.arg_ts[i], curr->expr_type)) {
-          string required_arg_type = Debug_GetTypeString(&checker->arena, node->call.called->expr_type->func_t.arg_ts[i]);
-          string actual_arg_type = Debug_GetTypeString(&checker->arena, curr->expr_type);
-          CheckerError(checker, node->marker, "Argument %d of the function call should have type %.*s but we got %.*s\n", i,
-                       str_expand(required_arg_type),
-                       str_expand(actual_arg_type));
-        }
-        curr = curr->next;
-      }
-      
-      node->expr_type = node->call.called->expr_type->func_t.ret_t;
-    } break;
-    
-    case NT_Expr_Ident: {
-      if (node->expr_type == type_refs[Type_Index_None] && !checker->ident_guarantee)
-        break;
-      
-      u32 idx;
-      if (IdentifierLookup(checker, node->ident.lexeme, &idx)) {
-        node->expr_type = checker->symbols.elems[idx].type;
-        node->is_constant = checker->symbols.elems[idx].is_constant;
-        node->constant_val = checker->symbols.elems[idx].constant_val;
-        break;
-      }
-      
-      if (checker->scope) {
-        CheckerError(checker, node->marker, "Unresolved Identifier %.*s\n",
-                     str_expand(node->ident.lexeme));
-      } else {
-        StringArrayBucket* addend = nullptr;
-        if (stable_table_get(ASTNodeRef, StringArrayBucket, &checker->pending_nodes,
-                             checker->curr_stmt, &addend)) {
-          darray_add(string, &addend->strings, node->ident.lexeme);
-        } else {
-          StringArrayBucket da = {0};
-          darray_add(string, &da.strings, node->ident.lexeme);
-          stable_table_set(ASTNodeRef, StringArrayBucket, &checker->pending_nodes,
-                           checker->curr_stmt, da);
-        }
-        checker->ident_dnf = true;
-      }
-      
-      node->expr_type = type_refs[Type_Index_None];
-      node->is_constant = false;
+      node->expr_type = Type_Index_Bool;
     } break;
     
     case NT_Expr_Index: {
-      Checker_CheckOuter(checker, node->index.left);
-      Checker_CheckOuter(checker, node->index.idx);
+      Checker_Transfer(c, node->index.left);
+      Checker_Transfer(c, node->index.idx);
+      ReturnIfError(c);
       
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, node->index.left->expr_type->type != TK_Array &&
-                       node->index.left->expr_type->type != TK_Pointer) {
-        string ty = Debug_GetTypeString(&checker->arena, node->index.left->expr_type);
-        CheckerError(checker, node->marker, "Only a pointer or array type can be indexed, but we got a '%.*s'\n", str_expand(ty));
+      CheckerIf (c,
+                 IsNotPointer(c, node->index.left->expr_type) &&
+                 IsNotArray(c, node->index.left->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->index.left->expr_type);
+        CheckerError(c, node->marker,
+                     "Only pointers and arrays can be indexed, but we got a '%.*s'\n",
+                     str_expand(t1));
       }
       
-      CheckerAssertion(checker, node->index.idx->expr_type->type != TK_Int) {
-        string ty = Debug_GetTypeString(&checker->arena, node->index.idx->expr_type);
-        CheckerError(checker, node->marker, "Only integer indexes are allowed but we got a '%.*s'\n", str_expand(ty));
+      CheckerIf (c,
+                 IsNotInteger(c, node->index.idx->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->index.idx->expr_type);
+        CheckerError(c, node->marker,
+                     "Only pointers and arrays can be indexed, but we got a '%.*s'\n",
+                     str_expand(t1));
       }
       
-      node->expr_type = reduce_type(node->index.left->expr_type);
-    } break;
-    
-    case NT_Expr_Deref: {
-      Checker_CheckOuter(checker, node->deref);
-      
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, node->deref->expr_type->type != TK_Pointer) {
-        string ty = Debug_GetTypeString(&checker->arena, node->deref->expr_type);
-        CheckerError(checker, node->marker, "Only a pointer can be dereferenced but we got a '%.*s'\n", str_expand(ty));
-      }
-      
-      node->expr_type = reduce_type(node->deref->expr_type);
+      node->expr_type = type_reduce(c, node->index.left->expr_type);
     } break;
     
     case NT_Expr_Addr: {
-      Checker_CheckOuter(checker, node->addr);
+      Checker_Transfer(c, node->addr);
+      ReturnIfError(c);
       
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, !is_lvalue(node->addr)) {
-        CheckerError(checker, node->marker, "You can only take the address of an addressable expression, but the given expression is not addressable\n");
+      CheckerIf (c,
+                 IsLValue(node->addr)) {
+        CheckerError(c, node->marker,
+                     "Can only take address of an l-value\n");
       }
       
-      node->expr_type = push_pointer_type(checker, node->addr->expr_type);
+      node->expr_type = type_push_pointer(c, node->addr->expr_type);
+    } break;
+    
+    case NT_Expr_FuncProto: {
+      Checker_Transfer(c, node->proto.return_type);
+      ASTNode* curr = node->proto.arg_types;
+      while (curr) {
+        Checker_Transfer(c, curr);
+        curr = curr->next;
+      }
+      ReturnIfError(c);
+      
+      CheckerIf (c,
+                 IsNotType(c, node->proto.return_type->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->proto.return_type->expr_type);
+        CheckerError(c, node->marker,
+                     "Return type must actually be a type, but we got '%.*s'\n",
+                     str_expand(t1));
+      }
+      
+      curr = node->proto.arg_types;
+      u32 i = 0;
+      while (curr) {
+        CheckerIf (c,
+                   IsNotType(c, curr->expr_type)) {
+          string t1 =
+            Debug_GetTypeString(c, curr->expr_type);
+          CheckerError(c, node->marker,
+                       "Argument %u must be a type, but we got '%.*s'\n",
+                       i, str_expand(t1));
+        }
+        i++;
+        curr = curr->next;
+      }
+      
+      ValueType* reg = pool_alloc(&c->allocator);
+      reg->type = TK_Func;
+      reg->func_t.ret_t = node->proto.return_type->expr_type;
+      reg->func_t.arity = node->proto.arity;
+      reg->func_t.arg_ts = arena_alloc(&c->arena, sizeof(TypeIndex) * node->proto.arity);
+      curr = node->proto.arg_types;
+      i = 0;
+      while (curr) {
+        reg->func_t.arg_ts[i] = curr->constant_val.type_lit;
+        i++;
+        curr = curr->next;
+      }
+      darray_add(ValueTypeRef, &c->type_cache, reg);
+      
+      node->expr_type = c->type_cache.len-1;
+    } break;
+    
+    case NT_Expr_Func: {
+      Checker_Transfer(c, node->func.proto);
+      /*Checker_Transfer(c, node->func.body);*/
+      
+      CheckingWork work = {
+        .type = Work_SimpleCheck,
+        .ref = node->func.body,
+      };
+      dqueue_push(CheckingWork, &c->worklist, work);
+      
+      ReturnIfError(c);
+      
+      node->expr_type = node->func.proto->expr_type;
+    } break;
+    
+    case NT_Expr_Deref: {
+      Checker_Transfer(c, node->deref);
+      ReturnIfError(c);
+      
+      CheckerIf (c,
+                 IsNotPointer(c, node->deref->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->deref->expr_type);
+        CheckerError(c, node->marker,
+                     "Only pointers can be dereferenced, but we got a '%.*s'\n",
+                     str_expand(t1));
+      }
+      
+      node->expr_type = type_reduce(c, node->deref->expr_type);
+    } break;
+    
+    case NT_Expr_Call: {
+      Checker_Transfer(c, node->call.called);
+      ASTNode* curr = node->call.args;
+      while (curr) {
+        Checker_Transfer(c, curr);
+        curr = curr->next;
+      }
+      ReturnIfError(c);
+      
+      CheckerIf (c,
+                 IsNotFunc(c, node->call.called->expr_type)) {
+        string t1 =
+          Debug_GetTypeString(c, node->call.called->expr_type);
+        CheckerError(c, node->marker,
+                     "Only functions can be called, but we got a '%.*s'\n",
+                     str_expand(t1));
+      }
+      
+      node->expr_type = type_reduce(c, node->call.called->expr_type);
+    } break;
+    
+    case NT_Expr_Ident: {
+      u32 idx;
+      CheckerIf (c, !symbol_lookup(c->symbols, node->ident.lexeme, 0, &idx)) {
+        CheckerError(c, node->marker,
+                     "Undeclared Identifier '%.*s'\n",
+                     str_expand(node->ident.lexeme));
+      }
+      
+      Symbol found = c->symbols.elems[idx];
+      node->is_constant = found.is_constant;
+      node->constant_val = found.constant_val;
+      node->expr_type = found.type;
     } break;
     
     case NT_Expr_Cast: {
-      Checker_CheckOuter(checker, node->cast.casted);
-      Checker_CheckOuter(checker, node->cast.type);
+      Checker_Transfer(c, node->cast.casted);
+      Checker_Transfer(c, node->cast.type);
+      ReturnIfError(c);
       
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, !node->cast.type->is_constant || node->cast.type->constant_val.type != CVT_Type) {
-        string t = Debug_GetTypeString(&checker->arena, node->cast.type->expr_type);
-        CheckerError(checker, node->marker, "The expression to cast to can only be a type but we got a '%.*s'\n", str_expand(t));
-      }
-      
-      CheckerAssertion(checker,
-                       !is_castable(node->cast.casted->expr_type,
-                                    node->cast.type->constant_val.type_lit)) {
+      CheckerIf (c,
+                 !is_castable(c, TypeGet(c, node->cast.casted->expr_type), TypeGet(c, node->cast.type->constant_val.type_lit))) {
         string t1 =
-          Debug_GetTypeString(&checker->arena, node->cast.casted->expr_type);
-        string t2 = Debug_GetTypeString(&checker->arena,
-                                        node->cast.type->constant_val.type_lit);
-        CheckerError(checker, node->marker, "'%.*s' cannot be casted to '%.*s'",
+          Debug_GetTypeString(c, node->cast.casted->expr_type);
+        string t2 =
+          Debug_GetTypeString(c, node->cast.type->constant_val.type_lit);
+        CheckerError(c, node->marker,
+                     "The type '%.*s' cannot be casted to '%.*s'\n",
                      str_expand(t1), str_expand(t2));
       }
       
@@ -788,483 +1138,533 @@ static void Checker_CheckOuter(Checker* checker, ASTNode* node) {
     } break;
     
     case NT_Expr_Access: {
-      Checker_CheckOuter(checker, node->access.left);
+      Checker_Transfer(c, node->access.left);
+      ReturnIfError(c);
       
-      CheckerReturnIfIdentDNF(checker);
-      
-      ValueType* left_base_t = node->access.left->expr_type;
-      ValueType* accessed_type = nullptr;
+      TypeIndex inner = Type_Index_None;
       if (node->access.deref) {
-        b8 failed = false;
-        CheckerAssertion(checker, left_base_t->type != TK_Pointer) failed = true;
-        if (!failed) {
-          CheckerAssertion(checker, !(left_base_t->ptr_t.sub_t->type == TK_Struct ||
-                                      left_base_t->ptr_t.sub_t->type == TK_Union)) {
-            failed = true;
-          }
+        CheckerIf (c,
+                   IsNotPointer(c, node->access.left->expr_type)) {
+          string t1 = Debug_GetTypeString(c, node->access.left->expr_type);
+          CheckerError(c, node->marker,
+                       "The expression being accessed is not a pointer to a struct or a union, but it is a '%.*s'\n",
+                       str_expand(t1));
         }
-        if (failed) {
-          string t = Debug_GetTypeString(&checker->arena, left_base_t);
-          CheckerError(checker, node->marker, "The left expression is not a pointer to a struct or union type, it is a '%.*s'", str_expand(t));
-        } else accessed_type = left_base_t->ptr_t.sub_t;
+        inner = TypeGet(c, node->access.left->expr_type)->ptr_t.sub_t;
+        CheckerIf(c,
+                  IsNotStruct(c, inner) && IsNotUnion(c, inner)) {
+          string t1 = Debug_GetTypeString(c, inner);
+          CheckerError(c, node->marker,
+                       "The expression being accessed is not a pointer to a struct or a union, but it is a '^%.*s'\n",
+                       str_expand(t1));
+        }
       } else {
-        CheckerAssertion(checker, !(left_base_t->type == TK_Struct || 
-                                    left_base_t->type == TK_Union)) {
-          string t = Debug_GetTypeString(&checker->arena, left_base_t);
-          CheckerError(checker, node->marker, "The left expression is not a struct or union type, it is a '%.*s'\n", str_expand(t));
-        } else {
-          accessed_type = left_base_t;
+        CheckerIf (c,
+                   IsNotStruct(c, node->access.left->expr_type) &&
+                   IsNotUnion(c, node->access.left->expr_type)) {
+          string t1 = Debug_GetTypeString(c, node->access.left->expr_type);
+          CheckerError(c, node->marker,
+                       "The expression being accessed is not a struct or a union, but it is a '%.*s'\n",
+                       str_expand(t1));
         }
+        inner = node->access.left->expr_type;
       }
       
-      if (!accessed_type) {
-        node->expr_type = type_refs[Type_Index_None];
-        return;
-      }
-      
-      Token_node* curr_name = accessed_type->compound_t.member_names.first;
-      u32 found = 0;
-      b8 success = false;
-      for (; found < accessed_type->compound_t.member_names.node_count; found++) {
-        if (str_eq(curr_name->token.lexeme, node->access.right.lexeme)) {
-          success = true;
+      ValueType* comp = TypeGet(c, inner);
+      Token_node* curr_name = comp->compound_t.member_names.first;
+      b8 found = false;
+      TypeIndex found_type = Type_Index_None;
+      u64 i = 0;
+      while (curr_name) {
+        if (str_eq(node->access.right.lexeme, curr_name->token.lexeme)) {
+          found = true;
+          found_type = comp->compound_t.member_ts[i];
           break;
         }
+        i++;
         curr_name = curr_name->next;
       }
       
-      if (!success) {
-        string t = Debug_GetTypeString(&checker->arena, accessed_type);
-        CheckerError(checker, node->marker, "The type '%.*s' does not have the member '%.*s'\n", str_expand(t), str_expand(node->access.right.lexeme));
-        return;
+      CheckerIf (c, !found) {
+        string t1 = Debug_GetTypeString(c, inner);
+        CheckerError(c, node->marker,
+                     "No member '%.*s' in the left struct/union '%.*s'\n",
+                     str_expand(node->access.right.lexeme), str_expand(t1));
       }
       
-      node->expr_type = accessed_type->compound_t.member_ts[found];
+      node->expr_type = found_type;
     } break;
     
+    
+    
+    
+    
     case NT_Type_Integer: {
-      u32 index = Type_Index_I32;
-      if (!node->int_type.is_signed)
-        index = Type_Index_U32;
       if (node->int_type.size == 64) {
-        if (index == Type_Index_I32)
-          index = Type_Index_I64;
-        else
-          index = Type_Index_U64;
+        node->constant_val.type_lit = node->int_type.is_signed ? Type_Index_I64 : Type_Index_U64;
+      } else if (node->int_type.size == 32) {
+        node->constant_val.type_lit = node->int_type.is_signed ? Type_Index_I32 : Type_Index_U32;
       }
-      node->constant_val.type_lit = type_refs[index];
-      node->expr_type = type_refs[Type_Index_Type];
+      
+      node->expr_type = Type_Index_Type;
     } break;
     
     case NT_Type_Float: {
-      u32 index = node->float_type.size == 64 ? Type_Index_F64 : Type_Index_F32;
-      node->constant_val.type_lit = type_refs[index];
-      node->expr_type = type_refs[Type_Index_Type];
+      if (node->float_type.size == 64) {
+        node->constant_val.type_lit = Type_Index_F64;
+      } else if (node->float_type.size == 32) {
+        node->constant_val.type_lit = Type_Index_F32;
+      }
+      
+      node->expr_type = Type_Index_Type;
     } break;
     
     case NT_Type_Void: {
-      node->constant_val.type_lit = type_refs[Type_Index_Void];
-      node->expr_type = type_refs[Type_Index_Type];
+      node->constant_val.type_lit = Type_Index_Void;
+      
+      node->expr_type = Type_Index_Type;
     } break;
-    
-    case NT_Type_Pointer: {
-      Checker_CheckOuter(checker, node->pointer_type.sub);
-      
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, !node->pointer_type.sub->is_constant || node->pointer_type.sub->constant_val.type != CVT_Type) {
-        string t = Debug_GetTypeString(&checker->arena, node->pointer_type.sub->expr_type);
-        CheckerError(checker, node->marker, "The pointer type modifer only applies to a type not a '%.*s'\n", str_expand(t));
-      }
-      
-      node->expr_type = type_refs[Type_Index_Type];
-      node->constant_val.type_lit = push_pointer_type(checker, node->pointer_type.sub->constant_val.type_lit);
-    } break;
-    
-    case NT_Type_Array: {
-      Checker_CheckOuter(checker, node->array_type.sub);
-      Checker_CheckOuter(checker, node->array_type.count);
-      
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, !node->array_type.sub->is_constant || node->array_type.sub->constant_val.type != CVT_Type) {
-        string t = Debug_GetTypeString(&checker->arena, node->array_type.sub->expr_type);
-        CheckerError(checker, node->marker, "The array type modifer only applies to a type not a '%.*s'\n", str_expand(t));
-      }
-      CheckerAssertion(checker, !node->array_type.count->is_constant || node->array_type.count->constant_val.type != CVT_Int) {
-        CheckerError(checker, node->marker, "Size of an array type must be a compile time constant\n");
-      }
-      
-      node->expr_type = type_refs[Type_Index_Type];
-      node->constant_val.type_lit = push_array_type(checker, node->array_type.sub->constant_val.type_lit, node->array_type.count->constant_val.int_lit);
-    } break;
-    
     
     case NT_Type_Func: {
-      Checker_CheckOuter(checker, node->func_type.return_type);
-      
-      ASTNode* curr = node->func_type.arg_types;
+      Checker_Transfer(c, node->func_type.return_type);
+      ASTNode* curr = node->compound_type.member_types;
       while (curr) {
-        Checker_CheckOuter(checker, curr);
+        Checker_Transfer(c, curr);
         curr = curr->next;
       }
       
-      CheckerReturnIfIdentDNF(checker);
-      
-      node->expr_type = type_refs[Type_Index_Type];
+      CheckerIf (c,
+                 IsNotType(c, node->func_type.return_type->expr_type)) {
+        string t1 = Debug_GetTypeString(c, node->func_type.return_type->expr_type);
+        CheckerError(c, node->marker,
+                     "The return type should actually be a type, but we got a '%.*s'\n",
+                     str_expand(t1));
+      }
       
       curr = node->func_type.arg_types;
+      u64 i = 0;
       while (curr) {
-        CheckerAssertion(checker, !curr->is_constant || curr->constant_val.type != CVT_Type) {
-          string instead = Debug_GetTypeString(&checker->arena, curr->expr_type);
-          CheckerError(checker, curr->marker, "Function Arguments should be constant types, instead we got a '%.*s'\n", str_expand(instead));
+        CheckerIf (c,
+                   IsNotType(c, curr->expr_type)) {
+          string t1 = Debug_GetTypeString(c, curr->expr_type);
+          CheckerError(c, node->marker,
+                       "The %llu-th arg type should actually be a type, but we got a '%.*s'\n",
+                       i, str_expand(t1));
         }
+        i++;
         curr = curr->next;
       }
       
-      ValueTypeBucket* ty = nullptr;
-      if (stable_table_get(ASTFuncRef, ValueTypeBucket, &checker->func_type_cache,
-                           node, &ty))  {
-        node->constant_val.type_lit = ty->type;
-        return;
-      }
-      
-      ValueTypeBucket bucket = {0};
-      bucket.type = pool_alloc(&checker->allocator);
-      bucket.type->type = TK_Func;
-      bucket.type->func_t.ret_t = node->func_type.return_type->constant_val.type_lit;
-      bucket.type->func_t.arg_ts =
-        arena_alloc(&checker->arena, sizeof(ValueType*) * node->func_type.arity);
-      bucket.type->func_t.arity = node->func_type.arity;
-      
+      ValueType* reg = pool_alloc(&c->allocator);
+      reg->type = TK_Func;
+      reg->size = POINTER_SIZE;
+      reg->func_t.ret_t = node->func_type.return_type->expr_type;
+      reg->func_t.arity = node->func_type.arity;
+      reg->func_t.arg_ts = arena_alloc(&c->arena, sizeof(TypeIndex) * node->func_type.arity);
       curr = node->func_type.arg_types;
-      for (int i = 0; i < node->func_type.arity; i++) {
-        bucket.type->func_t.arg_ts[i] = curr->constant_val.type_lit;
+      i = 0;
+      while (curr) {
+        reg->func_t.arg_ts[i] = curr->constant_val.type_lit;
+        i++;
         curr = curr->next;
       }
+      darray_add(ValueTypeRef, &c->type_cache, reg);
+      node->constant_val.type_lit = c->type_cache.len-1;
       
-      stable_table_set(ASTFuncRef, ValueTypeBucket, &checker->func_type_cache,
-                       node, bucket);
-      
-      node->constant_val.type_lit = bucket.type;
+      node->expr_type = Type_Index_Type;
     } break;
     
     case NT_Type_Struct:
     case NT_Type_Union: {
       ASTNode* curr = node->compound_type.member_types;
       while (curr) {
-        Checker_CheckOuter(checker, curr);
+        Checker_Transfer(c, curr);
         curr = curr->next;
       }
       
-      CheckerReturnIfIdentDNF(checker);
-      
-      node->expr_type = type_refs[Type_Index_Type];
-      
-      
       curr = node->compound_type.member_types;
+      u64 i = 0;
       while (curr) {
-        CheckerAssertion(checker, !curr->is_constant || curr->constant_val.type != CVT_Type) {
-          string instead = Debug_GetTypeString(&checker->arena, curr->expr_type);
-          CheckerError(checker, curr->marker, "Struct/Union members should be constant types, instead we got a '%.*s'\n", str_expand(instead));
+        CheckerIf (c,
+                   IsNotType(c, curr->expr_type)) {
+          string t1 = Debug_GetTypeString(c, curr->expr_type);
+          CheckerError(c, node->marker,
+                       "The %llu-th member type should actually be a type, but we got a '%.*s'\n",
+                       i, str_expand(t1));
         }
+        i++;
         curr = curr->next;
       }
       
-      
-      ValueTypeBucket* ty = nullptr;
-      if (stable_table_get(ASTCompoundTypeRef, ValueTypeBucket,
-                           &checker->compound_type_cache, node, &ty)) {
-        node->constant_val.type_lit = ty->type;
-        return;
-      }
-      
-      ValueTypeBucket bucket = {0};
-      bucket.type = pool_alloc(&checker->allocator);
-      bucket.type->type = node->type == NT_Type_Struct ? TK_Struct : TK_Union;
-      bucket.type->compound_t.member_ts = arena_alloc(&checker->arena, sizeof(ValueType*) *
-                                                      node->compound_type.member_count);
-      bucket.type->compound_t.member_names = node->compound_type.member_names;
-      bucket.type->compound_t.count = node->compound_type.member_count;
-      
+      ValueType* reg = pool_alloc(&c->allocator);
+      reg->type = node->type == NT_Type_Struct ? TK_Struct : TK_Union;
+      reg->compound_t.name         = node->compound_type.name;
+      reg->compound_t.member_names = node->compound_type.member_names;
+      reg->compound_t.count        = node->compound_type.member_count;
+      reg->compound_t.member_offsets = arena_alloc(&c->arena, sizeof(u64) * reg->compound_t.count);
+      reg->compound_t.member_ts = arena_alloc(&c->arena, sizeof(TypeIndex) * reg->compound_t.count);
       curr = node->compound_type.member_types;
-      for (int i = 0; i < node->compound_type.member_count; i++) {
-        bucket.type->compound_t.member_ts[i] = curr->constant_val.type_lit;
+      i = 0;
+      
+      while (curr) {
+        reg->compound_t.member_ts[i] = curr->constant_val.type_lit;
+        
+        u64 curr_size = TypeGet(c, curr->constant_val.type_lit)->size;
+        if (node->type == NT_Type_Struct) {
+          if (align_forward_u64(reg->size, 4) !=
+              align_forward_u64(reg->size + curr_size, 4)) {
+            align_forward_u64(reg->size, 4);
+          }
+          reg->compound_t.member_offsets[i] = reg->size;
+          reg->size += curr_size;
+        } else {
+          reg->size = Max(reg->size, curr_size);
+        }
+        
+        i++;
         curr = curr->next;
       }
+      reg->size = align_forward_u64(reg->size, 4);
       
-      stable_table_set(ASTCompoundTypeRef, ValueTypeBucket,
-                       &checker->compound_type_cache, node, bucket);
+      darray_add(ValueTypeRef, &c->type_cache, reg);
+      node->constant_val.type_lit = c->type_cache.len-1;
       
-      node->constant_val.type_lit = bucket.type;
+      node->expr_type = Type_Index_Type;
     } break;
     
+    case NT_Type_Pointer: {
+      ValueType* reg = pool_alloc(&c->allocator);
+      reg->type = TK_Pointer;
+      reg->size = POINTER_SIZE;
+      darray_add(ValueTypeRef, &c->type_cache, reg);
+      node->constant_val.type_lit = c->type_cache.len-1;
+      
+      CheckingWork work = {
+        .type = Work_SimpleCheck,
+        .ref = node->pointer_type.sub,
+        .to_update = &reg->ptr_t.sub_t,
+      };
+      dqueue_push(CheckingWork, &c->worklist, work);
+      
+      node->expr_type = Type_Index_Type;
+    } break;
+    
+    case NT_Type_Array: {
+      Checker_Transfer(c, node->array_type.count);
+      Checker_Transfer(c, node->array_type.sub);
+      
+      CheckerIf (c, !IsConstantInt(c, node->array_type.count)) {
+        CheckerError(c, node->array_type.count->marker,
+                     "Array Type count should be a constant integer\n");
+      }
+      CheckerIf (c, IsNotType(c, node->array_type.sub->expr_type)) {
+        CheckerError(c, node->array_type.sub->marker,
+                     "Array Modifier only applies to types\n");
+      }
+      
+      ValueType* reg = pool_alloc(&c->allocator);
+      reg->type = TK_Array;
+      reg->size = GetConstantInt(node->array_type.count) * TypeGet(c,GetConstantType(node->array_type.sub))->size;
+      
+      darray_add(ValueTypeRef, &c->type_cache, reg);
+      node->constant_val.type_lit = c->type_cache.len-1;
+      
+      node->expr_type = Type_Index_Type;
+    } break;
+    
+    
+    
+    
+    
+    
     case NT_Stmt_Assign: {
-      CheckerSetCurrentStatement(checker, node);
+      Checker_Transfer(c, node->binary_op.left);
+      Checker_Transfer(c, node->binary_op.right);
       
-      Checker_CheckOuter(checker, node->binary_op.left);
-      Checker_CheckOuter(checker, node->binary_op.right);
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, !CheckAbsolute(node->binary_op.left->expr_type, node->binary_op.right->expr_type)) {
-        string left  = Debug_GetTypeString(&checker->arena, node->binary_op.left->expr_type);
-        string right = Debug_GetTypeString(&checker->arena, node->binary_op.right->expr_type);
-        CheckerError(checker, node->marker, "The LHS and RHS for the binary operator should have the same types, but we got %.*s and %.*s instead\n",
-                     str_expand(left), str_expand(right));
+      CheckerIf (c, !IsLValue(node->binary_op.left)) {
+        CheckerError(c, node->marker,
+                     "The left expression cannot be assigned to\n");
+      }
+      CheckerIf (c,
+                 !CheckAbsolute(c, node->binary_op.left->expr_type, node->binary_op.right->expr_type)) {
+        CheckerError(c, node->marker,
+                     "The left and right expression types do not match\n");
       }
       
-      CheckerAssertion(checker, !is_lvalue(node->addr)) {
-        CheckerError(checker, node->marker, "You can only assign to expressions that have an address, but the one being assigned to does not\n");
-      }
-      
-      node->expr_type = type_refs[Type_Index_None];
+      node->expr_type = Type_Index_None;
     } break;
     
     case NT_Stmt_Expr: {
-      CheckerSetCurrentStatement(checker, node);
+      Checker_Transfer(c, node->expr_stmt);
       
-      Checker_CheckOuter(checker, node->expr_stmt);
-      CheckerReturnIfIdentDNF(checker);
-      
-      node->expr_type = type_refs[Type_Index_None];
+      node->expr_type = Type_Index_None;
     } break;
     
     case NT_Stmt_Block: {
-      CheckerSetCurrentStatement(checker, node);
+      ASTNode* curr = node->block;
       
-      node->expr_type = type_refs[Type_Index_None];
+      ScopeResetPoint p = scope_push(c);
+      while (curr) {
+        Checker_Transfer(c, curr);
+        curr = curr->next;
+      }
+      scope_pop(c, p);
+      
+      node->expr_type = Type_Index_None;
     } break;
     
     case NT_Stmt_While: {
-      CheckerSetCurrentStatement(checker, node);
+      Checker_Transfer(c, node->while_loop.condition);
+      ScopeResetPoint p = scope_push(c);
+      Checker_Transfer(c, node->while_loop.body);
+      scope_pop(c, p);
       
-      Checker_CheckOuter(checker, node->while_loop.condition);
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, !CheckAbsolute(node->while_loop.condition->expr_type, type_refs[Type_Index_Bool])) {
-        string condition = Debug_GetTypeString(&checker->arena, node->while_loop.condition->expr_type);
-        CheckerError(checker, node->marker, "Condition for the while loop should be a bool but we got a '%.*s' instead",
-                     str_expand(condition));
-      }
-      node->expr_type = type_refs[Type_Index_None];
+      node->expr_type = Type_Index_None;
     } break;
     
     case NT_Stmt_If: {
-      CheckerSetCurrentStatement(checker, node);
+      Checker_Transfer(c, node->if_stmt.condition);
+      ScopeResetPoint p = scope_push(c);
+      Checker_Transfer(c, node->if_stmt.then_body);
+      scope_pop(c, p);
       
-      Checker_CheckOuter(checker, node->if_stmt.condition);
-      CheckerReturnIfIdentDNF(checker);
-      
-      CheckerAssertion(checker, !CheckAbsolute(node->if_stmt.condition->expr_type, type_refs[Type_Index_Bool])) {
-        string condition = Debug_GetTypeString(&checker->arena, node->if_stmt.condition->expr_type);
-        CheckerError(checker, node->marker, "Condition for the if statement should be a bool but we got a '%.*s' instead",
-                     str_expand(condition));
+      if (node->if_stmt.else_body) {
+        ScopeResetPoint p = scope_push(c);
+        Checker_Transfer(c, node->if_stmt.else_body);
+        scope_pop(c, p);
       }
-      node->expr_type = type_refs[Type_Index_None];
+      
+      node->expr_type = Type_Index_None;
     } break;
     
     case NT_Stmt_Return: {
-      CheckerSetCurrentStatement(checker, node);
+      Checker_Transfer(c, node->return_stmt);
       
-      Checker_CheckOuter(checker, node->return_stmt);
-      CheckerReturnIfIdentDNF(checker);
-      
-      node->expr_type = type_refs[Type_Index_None];
+      node->expr_type = Type_Index_None;
     } break;
     
     case NT_Decl: {
-      CheckerSetCurrentStatement(checker, node);
+      Checker_Transfer(c, node->decl.type);
+      Checker_Transfer(c, node->decl.val);
       
-      Checker_CheckOuter(checker, node->decl.type);
-      Checker_CheckOuter(checker, node->decl.val);
-      CheckerReturnIfIdentDNF(checker);
+      ReturnIfError(c);
       
-      ValueType* typ;
-      if (node->decl.val)
-        typ = node->decl.val->expr_type;
-      
+      TypeIndex typ = Type_Index_None;
       if (node->decl.type) {
-        CheckerAssertion(checker, !CheckAbsolute(node->decl.type->expr_type, type_refs[Type_Index_Type])) {
-          string decltype = Debug_GetTypeString(&checker->arena, node->decl.type->expr_type);
-          CheckerError(checker, node->decl.type->marker, "The type expression in this declaration does not resolve to a type, it resolves to a '%.*s'\n",
-                       str_expand(decltype));
+        CheckerIf (c, IsNotType(c, node->decl.type->expr_type)) {
+          string t1 = Debug_GetTypeString(c, node->decl.type->expr_type);
+          CheckerError(c, node->decl.type->marker,
+                       "Declaration type should actually be a type, but we got a '%.*s'\n",
+                       str_expand(t1));
         }
         
         if (node->decl.val) {
-          CheckerAssertion(checker, !CheckAbsolute(node->decl.type->constant_val.type_lit, node->decl.val->expr_type)) {
-            string decltype = Debug_GetTypeString(&checker->arena, node->decl.type->constant_val.type_lit);
-            string declval = Debug_GetTypeString(&checker->arena, node->decl.val->expr_type);
-            CheckerError(checker, node->decl.type->marker, "The type expression in this declaration '%.*s', does not match the type of the value expression '%.*s'\n",
-                         str_expand(decltype), str_expand(declval));
+          CheckerIf (c,
+                     !CheckAbsolute(c, GetConstantType(node->decl.type), node->decl.val->expr_type)) {
+            string t1 = Debug_GetTypeString(c, GetConstantType(node->decl.type));
+            string t2 = Debug_GetTypeString(c, node->decl.val->expr_type);
+            CheckerError(c, node->marker,
+                         "Declaration type and type of the value assigned do not match, The type is '%.*s', and the value is a '%.*s'\n",
+                         str_expand(t1), str_expand(t2));
           }
         }
         
-        typ = node->decl.type->constant_val.type_lit;
+        typ = GetConstantType(node->decl.type);
+      } else {
+        typ = node->decl.val->expr_type;
       }
       
-      node->decl.resolved_type = typ;
-      
-      Symbol k = (Symbol) {
-        .ident = node->decl.ident,
-        .scope = checker->scope,
-        .type = typ,
-        .is_constant = node->decl.is_constant,
-      };
-      
-      if (node->decl.val && k.is_constant)
-        k.constant_val = node->decl.val->constant_val;
-      
-      i32 idx = -1;
-      for (i32 i = checker->symbols.len-1; i >= 0; i--) {
-        if (checker->symbols.elems[i].scope != checker->scope) break;
-        if (str_eq(checker->symbols.elems[i].ident.lexeme, k.ident.lexeme)) {
-          idx = i;
+      if (!(node->status & Status_ProtoResolved)) {
+        // If the prototype hasn't been transferred, then register the symbol
+        if (symbol_lookup(c->symbols, node->decl.ident.lexeme, c->scope, nullptr)) {
+          CheckerError(c, node->decl.ident,
+                       "Redeclared Identifier '%.*s'\n",
+                       str_expand(node->decl.ident.lexeme));
+        }
+        
+        Symbol reg = (Symbol) {
+          .ident = node->decl.ident,
+          .node = node,
+          .type = typ,
+          .scope = c->scope,
+        };
+        if (node->decl.val) {
+          reg.is_constant  = node->decl.val->is_constant;
+          reg.constant_val = node->decl.val->constant_val;
+        }
+        darray_add(Symbol, &c->symbols, reg);
+      } else {
+        // If the prototype has been transferred already, update old stuff
+        u32 idx;
+        if (!symbol_lookup(c->symbols, node->decl.ident.lexeme, c->scope, &idx)) {
+          unreachable;
+        }
+        
+        if (node->decl.val) {
+          c->symbols.elems[idx].is_constant  = node->decl.val->is_constant;
+          c->symbols.elems[idx].constant_val = node->decl.val->constant_val;
         }
       }
-      if (idx != -1) {
-        CheckerError(checker, node->marker, "Redeclaration of symbol '%.*s'\n", str_expand(k.ident.lexeme));
-      }
       
-#if defined(PRINT_ON_SYMBOL_REGISTER)
-      string tn = Debug_GetTypeString(&checker->arena, k.type);
-      printf("Registered Symbol %.*s: %.*s\n", str_expand(k.ident.lexeme),
-             str_expand(tn));
-#endif
-      
-      darray_add(Symbol, &checker->symbols, k);
-      
-      node->expr_type = type_refs[Type_Index_None];
-    } break;
-    
-    default: {
-      node->expr_type = type_refs[Type_Index_None];
+      node->expr_type = Type_Index_None;
     } break;
   }
   
+  node->status |= Status_Resolved | Status_ProtoResolved;
 }
 
-static void Checker_CheckNode(Checker* checker, ASTNode* node) {
-  Checker_CheckOuter(checker, node);
-  Checker_CheckInner(checker, node);
-}
+#undef CheckerIf
+#undef ReturnIfError
+#undef ReadyStat
+#undef ProtoReadyStat
 
 //~ Checker
 
 void Checker_Init(Checker* checker) {
   pool_init(&checker->allocator, sizeof(ValueType));
   arena_init(&checker->arena);
-  stable_table_init(ASTFuncRef, ValueTypeBucket, &checker->func_type_cache, 32);
-  stable_table_init(ModdedTypeKey, ModdedValueTypeBucket, &checker->modded_type_cache,
-                    32);
-  stable_table_init(ASTCompoundTypeRef, ValueTypeBucket,
-                    &checker->compound_type_cache, 32);
-  stable_table_init(ASTNodeRef, StringArrayBucket, &checker->pending_nodes, 32);
+  darray_reserve(ValueTypeRef, &checker->type_cache, 32);
   
-  type_refs[Type_Index_I32] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_I32]->type = TK_Int;
-  type_refs[Type_Index_I32]->int_t.size = 32;
-  type_refs[Type_Index_I32]->int_t.is_signed = true;
+  ValueType* type_none = pool_alloc(&checker->allocator);
+  type_none->type = TK_None;
+  type_none->size = 0;
+  darray_add(ValueTypeRef, &checker->type_cache, type_none);
   
-  type_refs[Type_Index_I64] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_I64]->type = TK_Int;
-  type_refs[Type_Index_I64]->int_t.size = 64;
-  type_refs[Type_Index_I64]->int_t.is_signed = true;
+  ValueType* type_i32 = pool_alloc(&checker->allocator);
+  type_i32->type = TK_Int;
+  type_i32->size = 4;
+  type_i32->int_t.size = 32;
+  type_i32->int_t.is_signed = true;
+  darray_add(ValueTypeRef, &checker->type_cache, type_i32);
   
-  type_refs[Type_Index_U32] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_U32]->type = TK_Int;
-  type_refs[Type_Index_U32]->int_t.size = 32;
-  type_refs[Type_Index_U32]->int_t.is_signed = false;
+  ValueType* type_i64 = pool_alloc(&checker->allocator);
+  type_i64->type = TK_Int;
+  type_i64->size = 8;
+  type_i64->int_t.size = 64;
+  type_i64->int_t.is_signed = true;
+  darray_add(ValueTypeRef, &checker->type_cache, type_i64);
   
-  type_refs[Type_Index_U64] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_U64]->type = TK_Int;
-  type_refs[Type_Index_U64]->int_t.size = 64;
-  type_refs[Type_Index_U64]->int_t.is_signed = false;
+  ValueType* type_u32 = pool_alloc(&checker->allocator);
+  type_u32->type = TK_Int;
+  type_u32->size = 4;
+  type_u32->int_t.size = 32;
+  type_u32->int_t.is_signed = false;
+  darray_add(ValueTypeRef, &checker->type_cache, type_u32);
   
-  type_refs[Type_Index_F32] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_F32]->type = TK_Float;
-  type_refs[Type_Index_F32]->float_t.size = 32;
+  ValueType* type_u64 = pool_alloc(&checker->allocator);
+  type_u64->type = TK_Int;
+  type_u64->size = 8;
+  type_u64->int_t.size = 64;
+  type_u64->int_t.is_signed = false;
+  darray_add(ValueTypeRef, &checker->type_cache, type_u64);
   
-  type_refs[Type_Index_F64] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_F64]->type = TK_Float;
-  type_refs[Type_Index_F64]->float_t.size = 32;
+  ValueType* type_f32 = pool_alloc(&checker->allocator);
+  type_f32->type = TK_Float;
+  type_f32->size = 4;
+  type_f32->float_t.size = 32;
+  darray_add(ValueTypeRef, &checker->type_cache, type_f32);
   
-  type_refs[Type_Index_Type] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_Type]->type = TK_Type;
+  ValueType* type_f64 = pool_alloc(&checker->allocator);
+  type_f64->type = TK_Float;
+  type_f32->size = 8;
+  type_f64->float_t.size = 32;
+  darray_add(ValueTypeRef, &checker->type_cache, type_f64);
   
-  type_refs[Type_Index_Void] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_Void]->type = TK_Void;
+  ValueType* type_type = pool_alloc(&checker->allocator);
+  type_type->type = TK_Type;
+  type_type->size = 0; // No Runtime Size
+  darray_add(ValueTypeRef, &checker->type_cache, type_type);
   
-  type_refs[Type_Index_Bool] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_Bool]->type = TK_Bool;
+  ValueType* type_void = pool_alloc(&checker->allocator);
+  type_void->type = TK_Void;
+  type_void->size = 0;
+  darray_add(ValueTypeRef, &checker->type_cache, type_void);
   
-  type_refs[Type_Index_None] = pool_alloc(&checker->allocator);
-  type_refs[Type_Index_None]->type = TK_None;
+  ValueType* type_bool = pool_alloc(&checker->allocator);
+  type_bool->type = TK_Bool;
+  type_bool->size = 1;
+  darray_add(ValueTypeRef, &checker->type_cache, type_bool);
 }
 
 void Checker_Check(Checker* checker, ASTNode* tree) {
   checker->tree = tree;
-  checker->ident_guarantee = false;
-  
-  ASTNode* curr = tree;
+  checker->worklist = (dqueue(CheckingWork)) {0};
+  ASTNode* curr = checker->tree;
   while (curr) {
-    Checker_CheckOuter(checker, curr);
+    dqueue_push(CheckingWork, &checker->worklist, ((CheckingWork) {
+                                                     .type = Work_Decl,
+                                                     .ref = curr,
+                                                   }));
     curr = curr->next;
   }
   
-  checker->ident_guarantee = true;
-  b8 changed = true;
-  while (changed && checker->pending_nodes.count) {
-    changed = false;
+  CheckingWork current_work = {0};
+  u32 unresolved_nodes = 0;
+  while (dqueue_pop(CheckingWork, &checker->worklist, &current_work)) {
+    ScopeResetPoint p = scope_push(checker);
+    Checker_IsReady(checker, current_work.ref, current_work.ref);
+    scope_pop(checker, p);
     
-    // Iterate through pending identifiers and possibly resolve them all
-    Iterate (checker->pending_nodes, i) {
-      StringArrayBucket* bucket = &checker->pending_nodes.elems[i];
-      if (ast_node_is_null(bucket->key)) continue;
+    if (current_work.ref->status & Status_Ready) {
+      Checker_Transfer(checker, current_work.ref);
       
-      while (bucket) {
-        u32 idx;
-        b8 available = true;
-        Iterate(bucket->strings, k) {
-          if (!IdentifierLookup(checker, bucket->strings.elems[k], &idx))
-            available = false;
-        }
-        if (available) {
-          if (bucket->key->type == NT_Decl) changed = true;
-          Checker_CheckOuter(checker, bucket->key);
-          stable_table_del(ASTNodeRef, StringArrayBucket, &checker->pending_nodes, bucket->key);
+      if (current_work.to_update)
+        *current_work.to_update = current_work.ref->constant_val.type_lit;
+      
+      unresolved_nodes = 0;
+    } else if (current_work.ref->status & Status_ProtoReady) {
+      Checker_ProtoTransfer(checker, current_work.ref);
+      
+      dqueue_push(CheckingWork, &checker->worklist, current_work);
+      // unresolved_nodes = 0;
+    } else {
+      dqueue_push(CheckingWork, &checker->worklist, current_work);
+      current_work.ref->status |= Status_Tried;
+      
+      if (unresolved_nodes == (checker->worklist.back-checker->worklist.front)) {
+        
+        // Dependency Cycle or Undeclared Identifier
+        // CheckerErrorNoRet(checker, (Token) {0}, "Dependency Cycle or Undeclared Identifier Detected\n");
+        
+        // Build Adjacency List
+        while (dqueue_pop(CheckingWork, &checker->worklist, &current_work)) {
+          if (current_work.type == Work_Decl)
+            Checker_ErrorsBuild(checker, current_work.ref, current_work.ref);
         }
         
-        bucket = bucket->hash_next;
+        // Detect Cycles
+        if (checker->cycles_exist)
+          Checker_DetectCycles(checker, &checker->cycle_checker);
+        
+        // Free Everything
+        Iterate (checker->cycle_checker, i)
+          darray_free(ASTNodeRef, &checker->cycle_checker.elems[i]);
+        darray_free(ASTNodeRef_array, &checker->cycle_checker);
+        
+        dqueue_free(CheckingWork, &checker->worklist);
+        return;
       }
+      
+      unresolved_nodes += 1;
     }
   }
-  checker->ident_guarantee = false;
   
-  if (checker->pending_nodes.count) {
-    CheckerError(checker, tree->marker, "Put a better error message here.. There was at least one unidentified identifier");
-    return;
-  }
-  
-  curr = tree;
-  while (curr) {
-    Checker_CheckInner(checker, curr);
-    curr = curr->next;
-  }
+  dqueue_free(CheckingWork, &checker->worklist);
+  printf("Done Checking\n");
 }
 
 void Checker_Free(Checker* checker) {
   pool_free(&checker->allocator);
   arena_init(&checker->arena);
-  stable_table_free(ASTFuncRef, ValueTypeBucket, &checker->func_type_cache);
-  stable_table_free(ModdedTypeKey, ModdedValueTypeBucket, &checker->modded_type_cache);
-  stable_table_free(ASTCompoundTypeRef, ValueTypeBucket, &checker->compound_type_cache);
-  stable_table_free(ASTNodeRef, StringArrayBucket, &checker->pending_nodes);
   darray_free(Symbol, &checker->symbols);
 }
 
 //~ Debug
 
-string Debug_GetTypeString(M_Arena* arena, ValueType* type) {
+string Debug_GetTypeString(Checker* c, TypeIndex idx) {
+  ValueType* type = TypeGet(c, idx);
+  M_Arena* arena = &c->arena;
+  
   if (!type) {
     return str_lit("void");
   }
@@ -1279,36 +1679,40 @@ string Debug_GetTypeString(M_Arena* arena, ValueType* type) {
     case TK_Float: return str_from_format(arena, "f%d", type->float_t.size);
     case TK_Type: return str_lit("type"); break;
     
-    case TK_Pointer: return str_cat(arena, str_lit("^"), Debug_GetTypeString(arena, type->ptr_t.sub_t));
+    case TK_Pointer: return str_cat(arena, str_lit("^"), Debug_GetTypeString(c, type->ptr_t.sub_t));
     case TK_Array: {
-      string subtype = Debug_GetTypeString(arena, type->ptr_t.sub_t);
+      string subtype = Debug_GetTypeString(c, type->ptr_t.sub_t);
       return str_from_format(arena, "[%llu]%.*s", type->array_t.count, str_expand(subtype));
     } break;
     
     case TK_Struct:
     case TK_Union: {
-      string_list sl = {0};
-      string_list_push(arena, &sl, type->type == TK_Struct
-                       ? str_lit("struct { ")
-                       : str_lit("union { "));
-      for (u64 i = 0; i < type->compound_t.count; i++) {
-        string_list_push(arena, &sl, Debug_GetTypeString(arena, type->compound_t.member_ts[i]));
-        string_list_push(arena, &sl, str_lit("; "));
+      if (type->compound_t.name.size) {
+        return type->compound_t.name;
+      } else {
+        string_list sl = {0};
+        string_list_push(arena, &sl, type->type == TK_Struct
+                         ? str_lit("<anon> struct { ")
+                         : str_lit("<anon> union { "));
+        for (u64 i = 0; i < type->compound_t.count; i++) {
+          string_list_push(arena, &sl, Debug_GetTypeString(c, type->compound_t.member_ts[i]));
+          string_list_push(arena, &sl, str_lit("; "));
+        }
+        string_list_push(arena, &sl, str_lit("}"));
+        
+        return string_list_flatten(arena, &sl);
       }
-      string_list_push(arena, &sl, str_lit("}"));
-      
-      return string_list_flatten(arena, &sl);
     } break;
     
     case TK_Func: {
       string_list sl = {0};
       string_list_push(arena, &sl, str_lit("func ("));
       for (u32 i = 0; i < type->func_t.arity; i++) {
-        string_list_push(arena, &sl, Debug_GetTypeString(arena, type->func_t.arg_ts[i]));
+        string_list_push(arena, &sl, Debug_GetTypeString(c, type->func_t.arg_ts[i]));
         if (i != type->func_t.arity-1) string_list_push(arena, &sl, str_lit(","));
       }
       string_list_push(arena, &sl, str_lit(") -> "));
-      string_list_push(arena, &sl, Debug_GetTypeString(arena, type->func_t.ret_t));
+      string_list_push(arena, &sl, Debug_GetTypeString(c, type->func_t.ret_t));
       return string_list_flatten(arena, &sl);
     } break;
     

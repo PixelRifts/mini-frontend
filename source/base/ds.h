@@ -146,6 +146,65 @@ free(stack->elems);\
 }
 
 
+
+#define DoubleCapacity(x) ((x) <= 0 ? 8 : x * 2)
+#define dqueue(type) type##_queue
+
+#define dqueue_push(type, q, data) type##_queue_push(q, data)
+#define dqueue_pop(type, q, d) type##_queue_pop(q, d)
+#define dqueue_peek(type, q) type##_queue_peek(q)
+#define dqueue_clear(type, q) type##_queue_clear(q)
+#define dqueue_free(type, q) type##_queue_free(q)
+
+#define Queue_Prototype(Data)\
+typedef struct Data##_queue {\
+u32 cap;\
+u32 front;\
+u32 back; /* One past last */\
+Data* elems;\
+} Data##_queue;\
+void Data##_queue_push(Data##_queue* q, Data data);\
+b8   Data##_queue_pop(Data##_queue* q, Data* ret);\
+Data Data##_queue_peek(Data##_queue* q);\
+void Data##_queue_clear(Data##_queue* q);\
+void Data##_queue_free(Data##_queue* q);
+
+#define Queue_Impl(Data)\
+void Data##_queue_push(Data##_queue* q, Data data) {\
+if (q->back + 1 > q->cap) {\
+u32 actual_len = q->back - q->front;\
+u32 new_cap = DoubleCapacity(Min(actual_len, q->cap));\
+Data* old = q->elems;\
+q->elems = malloc(new_cap * sizeof(Data));\
+memmove(q->elems, &old[q->front], actual_len * sizeof(Data));\
+free(old);\
+q->front = 0;\
+q->back = actual_len;\
+q->cap = new_cap;\
+}\
+q->elems[q->back++] = data;\
+}\
+b8 Data##_queue_pop(Data##_queue* q, Data* ret) {\
+if (q->front >= q->back)\
+return false;\
+*ret = q->elems[q->front++];\
+return true;\
+}\
+Data Data##_queue_peek(Data##_queue* q) {\
+return q->elems[q->front];\
+}\
+void Data##_queue_clear(Data##_queue* q) {\
+q->front = 0;\
+q->back = 0;\
+}\
+void Data##_queue_free(Data##_queue* q) {\
+q->front = 0;\
+q->back = 0;\
+q->cap = 0;\
+free(q->elems);\
+}
+
+
 #define HashTable_MaxLoad 0.75
 
 #define hash_table_key(key, value) key##_##value##_hash_table_key

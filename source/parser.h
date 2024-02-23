@@ -12,7 +12,11 @@
 //~ The AST
 
 typedef struct ASTNode ASTNode;
-typedef struct ValueType ValueType;
+typedef ASTNode* ASTNodeRef;
+DArray_Prototype(ASTNodeRef);
+DArray_Prototype(ASTNodeRef_array);
+
+typedef u64 TypeIndex;
 
 typedef enum NodeType {
   NT_Error,
@@ -22,13 +26,13 @@ typedef enum NodeType {
   NT_Expr_Add, NT_Expr_Sub, NT_Expr_Mul, NT_Expr_Div,
   NT_Expr_Mod, NT_Expr_Identity, NT_Expr_Negate, NT_Expr_Not,
   NT_Expr_Eq,  NT_Expr_Neq, NT_Expr_Less, NT_Expr_Greater,
-  NT_Expr_LessEq, NT_Expr_GreaterEq, NT_Expr_Func,
+  NT_Expr_LessEq, NT_Expr_GreaterEq, NT_Expr_FuncProto, NT_Expr_Func,
   NT_Expr_Index, NT_Expr_Addr, NT_Expr_Deref, NT_Expr_Call,
   NT_Expr_Ident, NT_Expr_Cast, NT_Expr_Access,
   
   // Types
   NT_Type_Integer, NT_Type_Float, NT_Type_Void,
-  NT_Type_Func, NT_Type_Struct, NT_Type_Union, /*NT_Type_Enum,*/
+  NT_Type_Func, NT_Type_Struct, NT_Type_Union,
   NT_Type_Pointer, NT_Type_Array,
   
   // Statements
@@ -38,6 +42,16 @@ typedef enum NodeType {
   // Declaration
   NT_Decl,
 } NodeType;
+
+typedef enum NodeStatus {
+  Status_Ready         = 0x1,
+  Status_ProtoReady    = 0x2,
+  Status_Resolved      = 0x4,
+  Status_ProtoResolved = 0x8,
+  Status_DepsBuilt     = 0x10,
+  Status_Waiting       = 0x20,
+  Status_Tried         = 0x40,
+} NodeStatus;
 
 typedef u8 OpPrecedence;
 enum {
@@ -71,12 +85,16 @@ typedef struct FuncCallNode {
   u32 arity;
 } FuncCallNode;
 
-typedef struct FuncNode {
+typedef struct FuncProtoNode {
   ASTNode* return_type;
   ASTNode* arg_types;
-  ASTNode* body;
   Token_list arg_names;
   u32 arity;
+} FuncProtoNode;
+
+typedef struct FuncNode {
+  ASTNode* proto;
+  ASTNode* body;
 } FuncNode;
 
 typedef struct CastNode {
@@ -115,6 +133,7 @@ typedef struct FuncTypeNode {
 } FuncTypeNode;
 
 typedef struct CompoundTypeNode {
+  string     name;
   u64        member_count;
   Token_list member_names;
   ASTNode*   member_types;
@@ -134,8 +153,11 @@ typedef struct IfStmtNode {
 typedef struct DeclNode {
   Token ident;
   ASTNode* type;
-  ValueType* resolved_type;
   ASTNode* val;
+  
+  i32 parent;
+  u16 color;
+  
   b8 is_constant;
 } DeclNode;
 
@@ -152,23 +174,28 @@ typedef struct ConstantValue {
   union {
     i64 int_lit;
     f64 float_lit;
-    ValueType* type_lit;
+    TypeIndex type_lit;
   };
 } ConstantValue;
 
 struct ASTNode {
+  // Basic Things
   NodeType type;
   ASTNode* next;
-  ValueType* expr_type;
   Token marker;
+  TypeIndex expr_type;
+  NodeStatus status;
   
+  // Constant Values
   b8 is_constant;
   ConstantValue constant_val;
   
+  // Subtypes
   union {
     Token ident;
     BinaryOpNode binary_op;
     UnaryOpNode  unary_op;
+    FuncProtoNode proto;
     FuncNode func;
     ArrayIndexNode index;
     FuncCallNode call;
@@ -194,8 +221,7 @@ struct ASTNode {
   };
 };
 
-typedef ASTNode* ASTNodeRef;
-DArray_Prototype(ASTNodeRef);
+Queue_Prototype(ASTNodeRef);
 
 //~ Parser
 
@@ -203,7 +229,9 @@ typedef struct Parser {
   M_Arena static_arena;
   M_Pool  allocator;
   u64 curr, next;
-  Token_array tokens;
+  u32 scope;
+  darray(Token) tokens;
+  
   string filename;
   b8 errored;
 } Parser;

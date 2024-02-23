@@ -1,5 +1,4 @@
-a: i32;
 
-foo :: func() {
-	a: u32;
+B :: struct {
+	b: ^B;
 };

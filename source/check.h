@@ -10,8 +10,7 @@
 
 //~ Types
 
-typedef u32 TypeKind;
-enum {
+typedef enum TypeKind {
   TK_None,
   TK_Int,
   TK_Float,
@@ -25,9 +24,10 @@ enum {
   TK_Union,
   
   TK_MAX,
-};
+} TypeKind;
 
 typedef struct ValueType ValueType;
+typedef u64 TypeIndex;
 
 typedef struct TypeInt {
   u32 size;
@@ -39,28 +39,31 @@ typedef struct TypeFloat {
 } TypeFloat;
 
 typedef struct TypeFunc {
-  ValueType* ret_t;
+  TypeIndex ret_t;
   u32 arity;
-  ValueType** arg_ts;
+  TypeIndex* arg_ts;
 } TypeFunc;
 
 typedef struct TypePointer {
-  ValueType* sub_t;
+  TypeIndex sub_t;
 } TypePointer;
 
 typedef struct TypeArray {
-  ValueType* sub_t;
+  TypeIndex sub_t;
   u64 count;
 } TypeArray;
 
 typedef struct TypeCompound {
-  ValueType** member_ts;
+  string name;
+  TypeIndex* member_ts;
   Token_list member_names;
+  u64* member_offsets;
   u64 count;
 } TypeCompound;
 
 struct ValueType {
   TypeKind type;
+  u64 size;
   
   union {
     TypeInt int_t;
@@ -72,6 +75,9 @@ struct ValueType {
   };
 };
 
+typedef ValueType* ValueTypeRef;
+DArray_Prototype(ValueTypeRef);
+
 typedef struct ValueTypeBucket ValueTypeBucket;
 struct ValueTypeBucket {
   ValueType* type;
@@ -81,58 +87,40 @@ struct ValueTypeBucket {
   ValueTypeBucket* hash_prev;
 };
 
-typedef ASTNode* ASTFuncRef;
-typedef ValueType* ValueTypeRef;
-StableTable_Prototype(ASTFuncRef, ValueTypeBucket);
-
-//~ Checker
-
-
-typedef enum ModdedTypeKind {
-  MTK_None,
-  MTK_Pointer,
-  MTK_Array,
-} ModdedTypeKind;
-typedef struct ModdedTypeKey {
-  ModdedTypeKind type;
-  ValueType* sub;
-  union {
-    u64 count;
-  };
-} ModdedTypeKey;
-typedef struct ModdedValueTypeBucket ModdedValueTypeBucket;
-struct ModdedValueTypeBucket {
-  ValueType* type;
-  ModdedTypeKey key;
-  
-  ModdedValueTypeBucket* hash_next;
-  ModdedValueTypeBucket* hash_prev;
-};
-StableTable_Prototype(ModdedTypeKey, ModdedValueTypeBucket);
-
-
-typedef ASTNode* ASTCompoundTypeRef;
-StableTable_Prototype(ASTCompoundTypeRef, ValueTypeBucket);
-
-
-typedef struct StringArrayBucket StringArrayBucket;
-struct StringArrayBucket {
-  ASTNode* key;
-  StringArrayBucket* hash_next;
-  StringArrayBucket* hash_prev;
-  
-  string_array strings;
-};
-StableTable_Prototype(ASTNodeRef, StringArrayBucket);
 
 typedef struct Symbol {
   Token ident;
-  ValueType* type;
+  ASTNode* node;
+  TypeIndex type;
   u32 scope;
   b8 is_constant;
   ConstantValue constant_val;
 } Symbol;
 DArray_Prototype(Symbol);
+
+
+typedef u32 ScopeResetPoint;
+
+// Required members: 'scope u32' and 'symbols darray(T)'
+#define scope_push(o)   ((o)->scope++, (o)->symbols.len)
+#define scope_pop(o, p) ((o)->scope--, (o)->symbols.len = p)
+
+
+typedef enum CheckingWorkType {
+  Work_Decl,
+  Work_SimpleCheck,
+} CheckingWorkType;
+
+typedef struct CheckingWork {
+  CheckingWorkType type;
+  
+  ASTNode* ref;
+  TypeIndex* to_update;
+} CheckingWork;
+
+Queue_Prototype(CheckingWork);
+
+//~ Checker
 
 typedef struct Checker {
   ASTNode* tree;
@@ -141,24 +129,19 @@ typedef struct Checker {
   string   filename;
   u32      scope;
   b8       errored;
-  b8       ident_dnf;
-  b8       ident_guarantee;
-  ASTNode* curr_stmt;
+  b8       cycles_exist;
   
-  stable_table(ASTFuncRef, ValueTypeBucket) func_type_cache;
-  stable_table(ModdedTypeKey, ModdedValueTypeBucket) modded_type_cache;
-  stable_table(ASTCompoundTypeRef, ValueTypeBucket) compound_type_cache;
+  dqueue(CheckingWork) worklist;
+  darray(ASTNodeRef_array) cycle_checker;
+  
+  darray(ValueTypeRef) type_cache;
   darray(Symbol) symbols;
-  
-  // TODO(voxel): Switch to darray, it's just going to be obviously better
-  //              Why on earth did I think a stable table would be good here
-  stable_table(ASTNodeRef, StringArrayBucket) pending_nodes;
 } Checker;
 
 void Checker_Init(Checker* checker);
 void Checker_Check(Checker* checker, ASTNode* tree);
 void Checker_Free(Checker* checker);
 
-string Debug_GetTypeString(M_Arena* arena, ValueType* type);
+string Debug_GetTypeString(Checker* c, TypeIndex idx);
 
 #endif //CHECK_H

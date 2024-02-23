@@ -67,7 +67,7 @@ s\
 #define flush fflush(stdout)
 #define trace Statement(printf("%s:%d: Trace\n", FILE_NAME, __LINE__); flush;)
 #define unreachable Statement(\
-printf("How did we get here? In %s on line %d\n", FILE_NAME, __LINE__);\
+printf("Compiler Error: How did we get here? In %s on line %d\n", FILE_NAME, __LINE__);\
 flush;\
 )
 

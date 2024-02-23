@@ -9,11 +9,11 @@
 
 #define DEFAULT_ALIGNMENT sizeof(void*)
 
-b8 is_power_of_two(uintptr_t x) {
+static b8 is_power_of_two(uintptr_t x) {
   return (x & (x-1)) == 0;
 }
 
-u64 align_forward_u64(u64 ptr, u64 align) {
+static u64 align_forward_u64(u64 ptr, u64 align) {
   u64 p, a, modulo;
   
   assert(is_power_of_two(align));

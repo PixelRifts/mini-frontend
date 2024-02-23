@@ -10,6 +10,8 @@ p->errored = true;\
 )
 
 DArray_Impl(ASTNodeRef);
+DArray_Impl(ASTNodeRef_array);
+Queue_Impl(ASTNodeRef);
 
 //~ Helpers
 
@@ -162,17 +164,25 @@ static ASTNode* make_unary_node(Parser* parser, ASTNode* operand, Token tok) {
   return node;
 }
 
+static ASTNode* make_func_proto_node(Parser* parser, Token marker, ASTNode* return_type, Token_list arg_names, ASTNode* arg_types, u32 arity) {
+  ASTNode* node = pool_alloc(&parser->allocator);
+  node->type = NT_Expr_FuncProto;
+  node->marker = marker;
+  node->proto.return_type = return_type;
+  node->proto.arg_types = arg_types;
+  node->proto.arg_names = arg_names;
+  node->proto.arity = arity;
+  return node;
+}
+
 static ASTNode* make_func_node(Parser* parser, Token marker, ASTNode* return_type,
                                Token_list arg_names, ASTNode* arg_types,
                                ASTNode* body, u32 arity) {
   ASTNode* node = pool_alloc(&parser->allocator);
   node->type = NT_Expr_Func;
   node->marker = marker;
-  node->func.return_type = return_type;
-  node->func.arg_types = arg_types;
+  node->func.proto = make_func_proto_node(parser, marker, return_type, arg_names, arg_types, arity);
   node->func.body = body;
-  node->func.arg_names = arg_names;
-  node->func.arity = arity;
   return node;
 }
 
@@ -300,7 +310,7 @@ static ASTNode* make_func_type_node(Parser* parser, Token marker, ASTNode* retur
   return node;
 }
 
-static ASTNode* make_compound_type_node(Parser* parser, Token marker,
+static ASTNode* make_compound_type_node(Parser* parser, Token marker, string name,
                                         u64 member_count, Token_list member_names, ASTNode* member_types) {
   ASTNode* node = pool_alloc(&parser->allocator);
   NodeType type = NT_Error;
@@ -310,6 +320,7 @@ static ASTNode* make_compound_type_node(Parser* parser, Token marker,
   }
   node->type = type;
   node->marker = marker;
+  node->compound_type.name = name;
   node->compound_type.member_count = member_count;
   node->compound_type.member_names = member_names;
   node->compound_type.member_types = member_types;
@@ -371,15 +382,20 @@ static ASTNode* make_decl_node(Parser* parser, Token ident, ASTNode* type,
   node->decl.type = type;
   node->decl.val = val;
   node->decl.is_constant = is_constant;
+  node->decl.color = 0;
+  node->decl.parent = -1;
   return node;
 }
 
 //~ Expression Parsing Helpers
 
-static ASTNode* Parser_ParseExpr(Parser* parser, OpPrecedence curr_op_prec);
+#define Parser_ParseExpr(p, op) Parser_ParseExpr_N(p, op, (string){0})
+#define Parser_ParsePrefixExpr(p) Parser_ParsePrefixExpr_N(p, (string){0})
+
+static ASTNode* Parser_ParseExpr_N(Parser* parser, OpPrecedence curr_op_prec, string decl_name);
 static ASTNode* Parser_ParseStmt(Parser* parser);
 
-static ASTNode* Parser_ParsePrefixExpr(Parser* parser) {
+static ASTNode* Parser_ParsePrefixExpr_N(Parser* parser, string decl_name) {
   switch (current_token_type(parser)) {
     case TT_IntLit: {
       Token curr = current_token(parser);
@@ -495,7 +511,8 @@ static ASTNode* Parser_ParsePrefixExpr(Parser* parser) {
         
         parser_eat(parser, TT_Semicolon);
       }
-      return make_compound_type_node(parser, mark, member_count, member_names, member_types);
+      return make_compound_type_node(parser, mark, decl_name, member_count,
+                                     member_names, member_types);
     } break;
     
     case TT_Func: {
@@ -507,6 +524,7 @@ static ASTNode* Parser_ParsePrefixExpr(Parser* parser) {
       ASTNode* ret = nullptr;
       Token_list arg_names = {0};
       u32 arity = 0;
+      
       while (!parser_match(parser, TT_CloseParen)) {
         arity += 1;
         
@@ -539,9 +557,12 @@ static ASTNode* Parser_ParsePrefixExpr(Parser* parser) {
           ParserError(parser, mark, "For Function Expressions, names are required for"
                       " every argument.\nIf you wanted a function type, "
                       "do not add curly braces\n");
+          
           return make_error_node(parser, mark);
         }
+        
         ASTNode* body = Parser_ParseStmt(parser);
+        
         return make_func_node(parser, mark, ret, arg_names, params, body, arity);
       }
       
@@ -619,8 +640,8 @@ static ASTNode* Parser_ParseInfixExpr(Parser* parser, ASTNode* left, Token op) {
 
 //~ Node Parsing
 
-static ASTNode* Parser_ParseExpr(Parser* parser, OpPrecedence curr_op_prec) {
-  ASTNode* left = Parser_ParsePrefixExpr(parser);
+static ASTNode* Parser_ParseExpr_N(Parser* parser, OpPrecedence curr_op_prec, string decl_name) {
+  ASTNode* left = Parser_ParsePrefixExpr_N(parser, decl_name);
   Token next_op = current_token(parser);
   OpPrecedence next_op_prec = precedence_lookup[next_op.type];
   
@@ -643,6 +664,7 @@ static ASTNode* Parser_ParseStmt(Parser* parser) {
   if (current_token_type(parser) == TT_OpenBrace) {
     Token mark = current_token(parser);
     parser_advance(parser);
+    
     ASTNode* ret = nullptr;
     ASTNode* curr = nullptr;
     while (current_token_type(parser) != TT_CloseBrace) {
@@ -663,6 +685,7 @@ static ASTNode* Parser_ParseStmt(Parser* parser) {
     parser_advance(parser);
     ASTNode* condition = Parser_ParseExpr(parser, Prec_None);
     ASTNode* body = Parser_ParseStmt(parser);
+    
     return make_while_node(parser, mark, condition, body);
     
   } else if (current_token_type(parser) == TT_If) {
@@ -670,9 +693,11 @@ static ASTNode* Parser_ParseStmt(Parser* parser) {
     parser_advance(parser);
     ASTNode* condition = Parser_ParseExpr(parser, Prec_None);
     ASTNode* then_body = Parser_ParseStmt(parser);
+    
     ASTNode* else_body = nullptr;
     if (parser_match(parser, TT_Else))
       else_body = Parser_ParseStmt(parser);
+    
     return make_if_node(parser, mark, condition, then_body, else_body);
     
   } else if (current_token_type(parser) == TT_Return) {
@@ -691,13 +716,13 @@ static ASTNode* Parser_ParseStmt(Parser* parser) {
     
     if (parser_match(parser, TT_Colon)) {
       // Typeless compile-time constant decl
-      ASTNode* value = Parser_ParseExpr(parser, Prec_None);
+      ASTNode* value = Parser_ParseExpr_N(parser, Prec_None, ident.lexeme);
       parser_eat(parser, TT_Semicolon);
       return make_decl_node(parser, ident, nullptr, value, true);
       
     } else if (parser_match(parser, TT_Equal)) {
       // Typeless variable decl
-      ASTNode* value = Parser_ParseExpr(parser, Prec_None);
+      ASTNode* value = Parser_ParseExpr_N(parser, Prec_None, ident.lexeme);
       parser_eat(parser, TT_Semicolon);
       return make_decl_node(parser, ident, nullptr, value, false);
       
@@ -712,17 +737,16 @@ static ASTNode* Parser_ParseStmt(Parser* parser) {
       
       if (parser_match(parser, TT_Colon)) {
         // Typed compile-time constant decl
-        ASTNode* value = Parser_ParseExpr(parser, Prec_None);
+        ASTNode* value = Parser_ParseExpr_N(parser, Prec_None, ident.lexeme);
         parser_eat(parser, TT_Semicolon);
         return make_decl_node(parser, ident, type, value, true);
         
       } else if (parser_match(parser, TT_Equal)) {
         // Typed variable decl
-        ASTNode* value = Parser_ParseExpr(parser, Prec_None);
+        ASTNode* value = Parser_ParseExpr_N(parser, Prec_None, ident.lexeme);
         parser_eat(parser, TT_Semicolon);
         return make_decl_node(parser, ident, type, value, false);
       }
-      
     }
     
   } else {
@@ -751,6 +775,7 @@ static ASTNode* Parser_ParseStmt(Parser* parser) {
 //~ Parser
 
 void Parser_Init(Parser* parser) {
+  MemoryZeroStruct(parser, Parser);
   parser->curr = 0; parser->next = 1;
   arena_init(&parser->static_arena);
   pool_init(&parser->allocator, sizeof(ASTNode));
@@ -884,15 +909,15 @@ static void Debug_Dump_Tree_Indented(ASTNode* node, u32 indent) {
       Debug_Dump_Tree_Indented(node->cast.type, indent+2);
     } break;
     
-    case NT_Expr_Func: {
-      printf("Func Expr:\n");
+    case NT_Expr_FuncProto: {
+      printf("Func Prototype:\n");
       for (u32 i = 0; i < (indent+1); i++) printf("  ");
       printf("Return:\n");
-      Debug_Dump_Tree_Indented(node->func.return_type, indent+2);
+      Debug_Dump_Tree_Indented(node->proto.return_type, indent+2);
       for (u32 i = 0; i < (indent+1); i++) printf("  ");
       printf("Args:\n");
-      ASTNode* curr = node->func.arg_types;
-      Token_node* curr_name = node->func.arg_names.first;
+      ASTNode* curr = node->proto.arg_types;
+      Token_node* curr_name = node->proto.arg_names.first;
       u32 i = 1;
       while (curr) {
         for (u32 i = 0; i < (indent+2); i++) printf("  ");
@@ -906,6 +931,12 @@ static void Debug_Dump_Tree_Indented(ASTNode* node, u32 indent) {
         curr_name = curr_name->next;
         i++;
       }
+    } break;
+    case NT_Expr_Func: {
+      printf("Func Expr:\n");
+      for (u32 i = 0; i < (indent+1); i++) printf("  ");
+      printf("Proto:\n");
+      Debug_Dump_Tree_Indented(node->func.proto, indent+2);
       for (u32 i = 0; i < (indent+1); i++) printf("  ");
       printf("Body:\n");
       Debug_Dump_Tree_Indented(node->func.body, indent+2);

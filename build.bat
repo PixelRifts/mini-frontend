@@ -3,7 +3,7 @@ SetLocal EnableDelayedExpansion
 IF NOT EXIST bin mkdir bin
 IF NOT EXIST bin\int mkdir bin\int
 
-SET name=compile3
+SET name=compile
 
 REM call vcvarsall.bat x64
 SET cc=clang
@@ -40,5 +40,5 @@ REM ==============
 
 REM SET compiler_flags=!compiler_flags! -fsanitize=address
 
-ECHO Building compile.exe...
+ECHO Building %name%.exe...
 %cc% %compiler_flags% %c_filenames% %defines% %include_flags% %output% %linker_flags%
